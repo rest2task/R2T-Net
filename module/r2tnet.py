@@ -6,6 +6,8 @@ import random
 from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser
 from typing import Dict, Iterable, Tuple
 
+import numpy as np
+
 import torch
 import torch.nn.functional as F
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
@@ -19,20 +21,77 @@ from .models.temporal_vit import TemporalViTEncoder
 from .utils.lr_scheduler import CosineAnnealingWarmUpRestarts
 
 
-class PredictionHead(nn.Module):
-    """Two-layer MLP used for behavioural predictions."""
+class ClassificationHead(nn.Module):
+    """Two-layer MLP used for behavioural classification."""
 
     def __init__(self, in_dim: int, hidden_dim: int, out_dim: int, dropout: float) -> None:
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, out_dim),
-        )
+        self.fc = nn.Linear(in_dim, hidden_dim)
+        self.dropout = nn.Dropout(dropout)
+        self.out = nn.Linear(hidden_dim, out_dim)
 
-    def forward(self, x: Tensor) -> Tensor:
-        return self.net(x)
+    def forward(self, x: Tensor) -> Dict[str, Tensor]:
+        z = self.fc(x)
+        z = F.relu(z, inplace=True)
+        z = self.dropout(z)
+        logits = self.out(z)
+        return {"prediction": logits}
+
+
+class TwoTierRegressionHead(nn.Module):
+    """Two-tier regression head with bin classification and residual refinement."""
+
+    def __init__(
+        self,
+        in_dim: int,
+        hidden_dim: int,
+        dropout: float,
+        bin_centers: Tensor,
+        bin_widths: Tensor,
+        bin_edges: Tensor,
+        temperature: float = 1.0,
+    ) -> None:
+        super().__init__()
+        if bin_centers.ndim != 2:
+            raise ValueError("bin_centers must be (K, m)")
+        self.hidden = nn.Linear(in_dim, hidden_dim)
+        self.dropout = nn.Dropout(dropout)
+        self.bin_classifier = nn.Linear(hidden_dim, bin_centers.size(0))
+        # residual head consumes hidden state and bin probabilities
+        self.residual = nn.Linear(hidden_dim + bin_centers.size(0), bin_centers.numel())
+        self.temperature = temperature
+        self.target_dim = bin_centers.size(1)
+        self.num_bins = bin_centers.size(0)
+
+        self.register_buffer("bin_centers", bin_centers)
+        self.register_buffer("bin_widths", bin_widths)
+        self.register_buffer("bin_edges", bin_edges)
+
+    def forward(self, x: Tensor) -> Dict[str, Tensor]:
+        z = self.hidden(x)
+        z = F.relu(z, inplace=True)
+        z = self.dropout(z)
+
+        logits = self.bin_classifier(z)
+        scaled_logits = logits / self.temperature if self.temperature != 1.0 else logits
+        bin_probs = F.softmax(scaled_logits, dim=-1)
+
+        residual_inp = torch.cat([z, bin_probs], dim=-1)
+        residual = self.residual(residual_inp)
+        residual = torch.tanh(residual)
+        residual = residual.view(-1, self.num_bins, self.target_dim)
+
+        centers = self.bin_centers.unsqueeze(0)
+        widths = self.bin_widths.unsqueeze(0)
+        refined = centers + widths * residual
+        prediction = torch.sum(bin_probs.unsqueeze(-1) * refined, dim=1)
+
+        return {
+            "prediction": prediction,
+            "logits": scaled_logits,
+            "probabilities": bin_probs,
+            "residual": residual,
+        }
 
 
 class R2TNet(pl.LightningModule):
@@ -95,12 +154,24 @@ class R2TNet(pl.LightningModule):
         # ---------------------------------------------------------------
         # Prediction head
         # ---------------------------------------------------------------
-        self.pred_head = PredictionHead(
-            in_dim=self.signature_dim,
-            hidden_dim=self.hparams.pred_hidden_dim,
-            out_dim=self.target_dim,
-            dropout=self.hparams.head_dropout,
-        )
+        if self.hparams.downstream_task_type == "classification":
+            self.pred_head = ClassificationHead(
+                in_dim=self.signature_dim,
+                hidden_dim=self.hparams.pred_hidden_dim,
+                out_dim=self.target_dim,
+                dropout=self.hparams.head_dropout,
+            )
+        else:
+            bin_stats = self._build_regression_bins(targets_np)
+            self.pred_head = TwoTierRegressionHead(
+                in_dim=self.signature_dim,
+                hidden_dim=self.hparams.pred_hidden_dim,
+                dropout=self.hparams.head_dropout,
+                bin_centers=bin_stats["centers"],
+                bin_widths=bin_stats["widths"],
+                bin_edges=bin_stats["edges"],
+                temperature=self.hparams.reg_temperature,
+            )
 
         # Metrics --------------------------------------------------------
         self.metrics = self._init_metrics()
@@ -131,8 +202,8 @@ class R2TNet(pl.LightningModule):
 
     def forward(self, x: Tensor, modality: Tensor) -> Tuple[Tensor, Tensor]:
         signature = self.encode(x, modality)
-        prediction = self.pred_head(signature)
-        return signature, prediction
+        head_out = self.pred_head(signature)
+        return signature, head_out["prediction"]
 
     # ------------------------------------------------------------------
     # data augmentation helpers
@@ -229,10 +300,99 @@ class R2TNet(pl.LightningModule):
         range_ = self.target_range.to(target.device)
         return (target - min_) / range_
 
-    def _supervised_loss(self, preds: Tensor, target: Tensor) -> Tensor:
+    def _build_regression_bins(self, targets_np) -> Dict[str, Tensor]:
+        targets_tensor = torch.tensor(targets_np, dtype=torch.float32)
+        scaled_targets = self._scale_targets(targets_tensor).cpu().numpy()
+
+        num_bins = self.hparams.reg_num_bins
+        if num_bins < 2:
+            raise ValueError("reg_num_bins must be at least 2 for two-tier regression")
+        strategy = self.hparams.reg_binning_strategy
+        quantiles = np.linspace(0.0, 1.0, num_bins + 1)
+        eps = 1e-6
+
+        centers: list[np.ndarray] = []
+        widths: list[np.ndarray] = []
+        edges: list[np.ndarray] = []
+
+        for j in range(scaled_targets.shape[1]):
+            column = scaled_targets[:, j]
+            col_min = float(column.min())
+            col_max = float(column.max())
+
+            if col_max - col_min < eps:
+                base = np.linspace(-0.5, 0.5, num_bins + 1)
+                edges_j = base + col_min
+            elif strategy == "quantile":
+                edges_j = np.quantile(column, quantiles)
+            else:
+                edges_j = np.linspace(col_min, col_max, num_bins + 1)
+
+            # ensure strictly increasing edges
+            edges_j = np.asarray(edges_j, dtype=np.float32)
+            edges_j[0] -= eps
+            edges_j[-1] += eps
+
+            widths_j = np.diff(edges_j)
+            widths_j[widths_j < eps] = eps
+            centers_j = edges_j[:-1] + 0.5 * widths_j
+
+            centers.append(centers_j)
+            widths.append(widths_j)
+            edges.append(edges_j)
+
+        centers_arr = torch.tensor(np.stack(centers, axis=1), dtype=torch.float32)
+        widths_arr = torch.tensor(np.stack(widths, axis=1), dtype=torch.float32)
+        edges_arr = torch.tensor(np.stack(edges, axis=1), dtype=torch.float32)
+
+        return {"centers": centers_arr, "widths": widths_arr, "edges": edges_arr}
+
+    def _assign_bins(self, target: Tensor) -> Tensor:
+        edges = self.pred_head.bin_edges.to(target.device)
+        interior = edges[1:-1]
+        indices = []
+        for j in range(target.size(1)):
+            boundaries = interior[:, j]
+            idx = torch.bucketize(target[:, j], boundaries, right=False)
+            idx = torch.clamp(idx, max=self.pred_head.num_bins - 1)
+            indices.append(idx)
+        return torch.stack(indices, dim=1)
+
+    def _two_tier_loss(self, head_out: Dict[str, Tensor], target: Tensor) -> Tuple[Tensor, Dict[str, Tensor]]:
+        logits = head_out["logits"]
+        probs = head_out["probabilities"]
+        residual = head_out["residual"]
+
+        bin_indices = self._assign_bins(target)
+        batch, target_dim = target.shape
+        num_bins = probs.size(1)
+
+        logits_rep = logits.unsqueeze(1).expand(-1, target_dim, -1).reshape(-1, num_bins)
+        labels = bin_indices.reshape(-1)
+        label_smoothing = float(self.hparams.reg_label_smoothing)
+        cls_loss = F.cross_entropy(
+            logits_rep,
+            labels,
+            reduction="mean",
+            label_smoothing=label_smoothing if label_smoothing > 0 else 0.0,
+        )
+
+        centers = self.pred_head.bin_centers.to(target.device).unsqueeze(0)
+        widths = self.pred_head.bin_widths.to(target.device).unsqueeze(0)
+        target_exp = target.unsqueeze(1)
+        target_norm = (target_exp - centers) / widths
+        huber = F.smooth_l1_loss(residual, target_norm, reduction="none")
+        huber = huber.mean(dim=2)
+        reg_loss = torch.sum(probs * huber, dim=1).mean()
+
+        total = self.hparams.reg_alpha * cls_loss + self.hparams.reg_beta * reg_loss
+        return total, {"cls_loss": cls_loss.detach(), "reg_loss": reg_loss.detach()}
+
+    def _supervised_loss(self, head_out: Dict[str, Tensor], target: Tensor) -> Tuple[Tensor, Dict[str, Tensor]]:
         if self.hparams.downstream_task_type == "classification":
-            return F.binary_cross_entropy_with_logits(preds, target)
-        return F.mse_loss(preds, target)
+            loss = F.binary_cross_entropy_with_logits(head_out["prediction"], target)
+            return loss, {}
+        return self._two_tier_loss(head_out, target)
 
     # ------------------------------------------------------------------
     # training / validation
@@ -265,7 +425,8 @@ class R2TNet(pl.LightningModule):
             return contrastive_loss
 
         subject_sig = F.normalize((rest_sig + task_sig) * 0.5, dim=1)
-        preds = self.pred_head(subject_sig)
+        head_out = self.pred_head(subject_sig)
+        preds = head_out["prediction"]
 
         target = batch["target"].float()
         if target.ndim == 1:
@@ -273,31 +434,36 @@ class R2TNet(pl.LightningModule):
         if self.hparams.downstream_task_type != "classification":
             target = self._scale_targets(target)
 
-        sup_loss = self._supervised_loss(preds, target)
+        sup_loss, sup_logs = self._supervised_loss(head_out, target)
         self.log("train_supervised_loss", sup_loss, prog_bar=True, batch_size=rest_x.size(0))
+        for name, value in sup_logs.items():
+            self.log(f"train_{name}", value, prog_bar=False, batch_size=rest_x.size(0))
 
         total_loss = sup_loss + self.hparams.lambda_contrast * contrastive_loss
         return total_loss
 
-    def _run_supervised(self, batch) -> Tuple[Tensor, Tensor]:
+    def _run_supervised(self, batch) -> Tuple[Dict[str, Tensor], Tensor]:
         x = batch["fmri"]
         modality = batch.get("modality")
         if modality is None:
             modality = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
         signature = self.encode(x, modality)
-        preds = self.pred_head(signature)
-        return preds, signature
+        head_out = self.pred_head(signature)
+        return head_out, signature
 
     def validation_step(self, batch, _):
-        preds, _ = self._run_supervised(batch)
+        head_out, _ = self._run_supervised(batch)
+        preds = head_out["prediction"]
         target = batch["target"].float()
         if target.ndim == 1:
             target = target.unsqueeze(-1)
         if self.hparams.downstream_task_type != "classification":
             target = self._scale_targets(target)
 
-        loss = self._supervised_loss(preds, target)
+        loss, sup_logs = self._supervised_loss(head_out, target)
         self.log("valid_loss", loss, prog_bar=False, batch_size=target.size(0))
+        for name, value in sup_logs.items():
+            self.log(f"valid_{name}", value, prog_bar=False, batch_size=target.size(0))
 
         if self.hparams.downstream_task_type == "classification":
             probs = torch.sigmoid(preds)
@@ -409,6 +575,16 @@ class R2TNet(pl.LightningModule):
             choices=["standardization", "minmax"],
             default="standardization",
         )
+        downstream.add_argument("--reg_num_bins", type=int, default=8)
+        downstream.add_argument(
+            "--reg_binning_strategy",
+            choices=["quantile", "uniform"],
+            default="quantile",
+        )
+        downstream.add_argument("--reg_alpha", type=float, default=1.0)
+        downstream.add_argument("--reg_beta", type=float, default=2.0)
+        downstream.add_argument("--reg_temperature", type=float, default=1.0)
+        downstream.add_argument("--reg_label_smoothing", type=float, default=0.0)
 
         return p
 
