@@ -217,13 +217,3 @@ Output: CSV file with columns `subject_id,prediction`.
 | `--num_rois 360 --input_kind roi` | Switch to ROI-based input (instead of volumes) |
 | `--grayordinates`                 | Use 91,282-dim grayordinate inputs             |
 
-
-### 7 · Troubleshooting
-
-| Symptom             | Likely Fix                                     |
-| ------------------- | ---------------------------------------------- |
-| **CUDA OOM**        | Reduce `--batch_size`, or add `--precision 16` |
-| **Loss = NaN**      | Check `--total_steps` ≫ `--warmup_pct`         |
-| **AUROC = 0.5**     | Check for constant or missing labels           |
-| **Slow dataloader** | Increase `--num_workers`; pre-convert to `.pt` |
-
