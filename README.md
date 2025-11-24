@@ -44,7 +44,7 @@ Edit one line in `module/models/load_model.py` to plug in any encoder that outpu
 | **Cosine‑warmup scheduler** | Enable with `--use_scheduler` |
 | **Built-in regularisation** | Temporal crops, Gaussian noise, modality dropout, and gradient clipping (\|g\|=1) |
 | **Metrics out‑of‑the‑box** | Pearson / MSE / MAE (regression), Balanced‑Acc / AUROC (classification) |
-| **Runs on a single GPU** | Batch accumulation + mixed precision available |
+| **Multi-GPU ready** | DDP support with distributed samplers and sampler replacement disabled |
 
 ---
 
@@ -163,6 +163,21 @@ python train.py \
   --model swin4d_ver7 \
   --batch_size 8 --max_epochs 50 \
   --use_scheduler --total_steps 20000
+```
+
+#### Multi-GPU (DDP) Training
+
+Enable distributed training by requesting multiple devices. The trainer defaults to `ddp` when more than one device is set, and
+the data module automatically switches to distributed samplers.
+
+```bash
+python train.py \
+  --data_dir data/S1200 \
+  --dataset_type rest \
+  --contrastive \
+  --model swin4d_ver7 \
+  --batch_size 8 --max_epochs 50 \
+  --accelerator gpu --devices 4 --precision 16
 ```
 
 #### B. Fine-tune with Labels (Regression)
