@@ -10,6 +10,8 @@ import pytorch_lightning as pl
 import torch
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, WeightedRandomSampler
+from torch.utils.data.distributed import DistributedSampler
+from pytorch_lightning.utilities import rank_zero_warn
 
 from .datasets import S1200        # your existing dataset class
 
@@ -66,6 +68,15 @@ class fMRIDataModule(pl.LightningDataModule):
         self.scaler = None                     # set in setup()
         self._subject_dict: Dict[str, Tuple[int, float]] | None = None
         self._splits: Dict[str, List[str]] | None = None
+        self._train_sampler = None
+
+    def _is_distributed(self) -> bool:
+        """Return True when running with >1 processes (DDP / FSDP)."""
+
+        if self.trainer is None:
+            return False
+        # Lightning populates world_size after the trainer is attached.
+        return getattr(self.trainer, "world_size", 1) > 1
 
     # ------------- setup --------------------------------
     def _load_metadata(self) -> None:
@@ -141,13 +152,42 @@ class fMRIDataModule(pl.LightningDataModule):
         )
 
     # ------------- loaders ------------------------------
-    def train_dataloader(self):
+    def _distributed_sampler(self, dataset, *, shuffle: bool) -> DistributedSampler:
+        return DistributedSampler(
+            dataset,
+            shuffle=shuffle,
+            drop_last=False,
+        )
+
+    def _make_train_sampler(self):
+        is_distributed = self._is_distributed()
+
         if self.hparams["balanced_sampling"]:
+            if is_distributed:
+                rank_zero_warn(
+                    "balanced_sampling uses a distributed sampler when running on multiple GPUs; "
+                    "per-subject weighting is applied only in single-GPU runs."
+                )
+                return self._distributed_sampler(self.train_dataset, shuffle=True)
+
             counts = Counter(self.train_dataset.subject_ids)
             weights = [1.0 / counts[sid] for sid in self.train_dataset.subject_ids]
-            sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
-        else:
-            sampler = RandomSampler(self.train_dataset)
+            return WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+
+        if is_distributed:
+            return self._distributed_sampler(self.train_dataset, shuffle=True)
+
+        return RandomSampler(self.train_dataset)
+
+    def _make_eval_sampler(self, dataset):
+        if self._is_distributed():
+            return self._distributed_sampler(dataset, shuffle=False)
+
+        return SequentialSampler(dataset)
+
+    def train_dataloader(self):
+        sampler = self._make_train_sampler()
+        self._train_sampler = sampler
 
         persistent_workers = self.hparams["num_workers"] > 0
 
@@ -166,7 +206,7 @@ class fMRIDataModule(pl.LightningDataModule):
         return DataLoader(
             self.val_dataset,
             batch_size=self.hparams["batch_size"],
-            sampler=SequentialSampler(self.val_dataset),
+            sampler=self._make_eval_sampler(self.val_dataset),
             num_workers=self.hparams["num_workers"],
             pin_memory=True,
             persistent_workers=persistent_workers,
@@ -178,8 +218,15 @@ class fMRIDataModule(pl.LightningDataModule):
         return DataLoader(
             self.test_dataset,
             batch_size=self.hparams["batch_size"],
-            sampler=SequentialSampler(self.test_dataset),
+            sampler=self._make_eval_sampler(self.test_dataset),
             num_workers=self.hparams["num_workers"],
             pin_memory=True,
             persistent_workers=persistent_workers,
         )
+
+    # ------------- distributed utilities -------------
+    def on_train_epoch_start(self):
+        """Ensure per-epoch shuffling across ranks when using DistributedSampler."""
+
+        if isinstance(self._train_sampler, DistributedSampler):
+            self._train_sampler.set_epoch(self.trainer.current_epoch)
