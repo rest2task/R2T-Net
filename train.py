@@ -88,10 +88,32 @@ def main():
     ckpt_callback = make_ckpt_cb(args)
     lr_monitor = LearningRateMonitor(logging_interval="step")
 
+    # Infer a sensible default for distributed training when multiple devices
+    # are requested but no explicit strategy was provided.
+    strategy = getattr(args, "strategy", None)
+    inferred_strategy = None
+
+    def _num_requested_devices(devices) -> int | None:
+        if devices is None:
+            return None
+        if isinstance(devices, int):
+            return devices
+        if isinstance(devices, str):
+            return int(devices) if devices.isdigit() else None
+        if isinstance(devices, (list, tuple)):
+            return len(devices)
+        return None
+
+    num_devices = _num_requested_devices(getattr(args, "devices", None))
+    if strategy is None and num_devices and num_devices > 1:
+        inferred_strategy = "ddp"
+
     trainer = pl.Trainer.from_argparse_args(
         args,
         logger=logger,
         callbacks=[ckpt_callback, lr_monitor],
+        strategy=strategy or inferred_strategy,
+        replace_sampler_ddp=False,  # samplers handled inside the DataModule
     )
 
     if args.test_only:
