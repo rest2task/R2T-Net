@@ -17,9 +17,7 @@ Traditional pipelines handle rs‑fMRI and t‑fMRI separately, often compressin
 **R2T‑Net** instead:
 
 * Learns a **modality‑invariant** embedding (rest ⇄ task).  
-* Produces **person‑specific** vectors (positive pairs = same subject).  
-* Shows good **test–retest stability**.  
-* Lets you predict behaviour from *resting scans only*, cutting scan time.
+* Produces **person‑specific** vectors (positive pairs = same subject). 
 
 ---
 
@@ -35,18 +33,6 @@ Edit one line in `module/models/load_model.py` to plug in any encoder that outpu
 
 ---
 
-## Key Features
-
-| Feature | Details |
-|---------|---------|
-| **Input‑agnostic** | Raw 4‑D volumes `[C,H,W,D,T]`, grayordinates `[91 282,T]`, or ROI series `[V,T]` |
-| **Always contrastive** | NT‑Xent runs in every mode; you choose to freeze or unfreeze the prediction head |
-| **Cosine‑warmup scheduler** | Enable with `--use_scheduler` |
-| **Built-in regularisation** | Temporal crops, Gaussian noise, modality dropout, and gradient clipping (\|g\|=1) |
-| **Metrics out‑of‑the‑box** | Pearson / MSE / MAE (regression), Balanced‑Acc / AUROC (classification) |
-| **Multi-GPU ready** | DDP support with distributed samplers and sampler replacement disabled |
-
----
 
 ## Directory Layout
 
@@ -148,7 +134,7 @@ The scripts populate `data/S1200/img/<subject>/frame_*.pt` in fp16 format and cr
 | **Self-supervised** | ✅       | ❌ (frozen) | `--contrastive --pretraining --freeze_head`              |
 | **Full fine-tune**  | ✅       | ✅          | `--contrastive` *(default)*                              |
 
-> ⚠️ Omitting `--contrastive` disables NT-Xent loss (core to R2T‑Net).
+> ⚠️ Omitting `--contrastive` disables NT-Xent loss.
 
 
 ### 4 · Example Commands
@@ -195,40 +181,3 @@ python train.py \
   --temporal_crop_min_ratio 0.8 --gaussian_noise_std 0.01 \
   --gaussian_noise_p 0.1 --modality_dropout_prob 0.2
 ```
-
-#### C. Evaluate/Test Only
-
-```bash
-python train.py \
-  --test_only --test_ckpt logs/epoch02-valid_loss=0.2100.ckpt \
-  --data_dir data/S1200
-```
-
-
-### 5 · Inference (e.g., rs-fMRI → prediction)
-
-```bash
-python inference.py \
-  --ckpt logs/epoch03-valid_loss=0.2100.ckpt \
-  --input_dir data/S1200/img \
-  --input_kind vol \
-  --output rs_predictions.csv
-```
-
-Output: CSV file with columns `subject_id,prediction`.
-
-
-### 6 · Recommended Flags
-
-| Flag                              | Purpose                                        |
-| --------------------------------- | ---------------------------------------------- |
-| `--precision 16`                  | Mixed precision — saves memory                 |
-| `--accumulate_grad_batches 2`     | Gradient accumulation (for small GPUs)         |
-| `--resume_from_checkpoint ...`    | Resume training from last/best                 |
-| `--balanced_sampling`             | Ensures equal subject exposure per epoch       |
-| `--temporal_crop_min_ratio 0.9`   | Tighten temporal cropping during training      |
-| `--gaussian_noise_std 0.0`        | Disable stochastic noise injection             |
-| `--modality_dropout_prob 0.0`     | Train without modality dropout                 |
-| `--num_rois 360 --input_kind roi` | Switch to ROI-based input (instead of volumes) |
-| `--grayordinates`                 | Use 91,282-dim grayordinate inputs             |
-
