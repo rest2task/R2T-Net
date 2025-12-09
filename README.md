@@ -147,7 +147,7 @@ python train.py \
   --dataset_type rest \
   --contrastive --pretraining --freeze_head \
   --model swin4d_ver7 \
-  --batch_size 8 --max_epochs 50 \
+  --batch_size 4 --max_epochs 2000 \
   --use_scheduler --total_steps 20000
 ```
 
@@ -162,7 +162,7 @@ python train.py \
   --dataset_type rest \
   --contrastive \
   --model swin4d_ver7 \
-  --batch_size 8 --max_epochs 50 \
+  --batch_size 4 --max_epochs 100 \
   --accelerator gpu --devices 4 --precision 16
 ```
 
@@ -177,10 +177,17 @@ python train.py \
   --downstream_task_type regression \
   --label_scaling_method standardization \
   --model swin4d_ver7 \
-  --batch_size 4 --max_epochs 30 --use_scheduler \
+  --batch_size 4 --max_epochs 100 --use_scheduler \
   --temporal_crop_min_ratio 0.8 --gaussian_noise_std 0.01 \
   --gaussian_noise_p 0.1 --modality_dropout_prob 0.2
 ```
+
+---
+
+## Acknowledgments
+
+
+---
 
 ## Contact
 
