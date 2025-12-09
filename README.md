@@ -9,7 +9,6 @@ A lightweight supervised head can optionally be added to predict cognitive or be
 
 A test script, `extract.py`, allows direct extraction of these signatures from a trained checkpoint.
 
----
 
 ## Motivation
 
@@ -19,7 +18,6 @@ Traditional pipelines handle rs‑fMRI and t‑fMRI separately, often compressin
 * Learns a **modality‑invariant** embedding (rest ⇄ task).  
 * Produces **person‑specific** vectors (positive pairs = same subject). 
 
----
 
 ## Backbone Flexibility
 
@@ -30,8 +28,6 @@ Edit one line in `module/models/load_model.py` to plug in any encoder that outpu
 | Transformer‑4D     | `swin4d_ver7` (default) ·  ViT · TimeSformer |
 | 3‑D CNN            | 3‑D ResNet, 3‑D DenseNet, UNet‑3D |
 | Hybrid             | CNN + GRU, Perceiver IO, Temporal‑U‑Net |
-
----
 
 
 ## Directory Layout
@@ -57,8 +53,6 @@ R2TNet/
 └── logs/                   # auto‑generated (TensorBoard & checkpoints)
 
 ````
-
----
 
 
 ## Quick Start
@@ -182,12 +176,10 @@ python train.py \
   --gaussian_noise_p 0.1 --modality_dropout_prob 0.2
 ```
 
----
 
 ## Acknowledgments
 
 
----
 
 ## Contact
 
