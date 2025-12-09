@@ -179,6 +179,27 @@ python train.py \
 
 ## Acknowledgments
 
+This work is inspired by and builds upon the following open-source projects and resources:
+
+- **SwiFT (Swin 4D fMRI Transformer)**  
+  https://github.com/Transconnectome/SwiFT
+
+- **SwiFUN (Swin fMRI UNet Transformer)**  
+  https://github.com/Transconnectome/SwiFUN
+
+- **Swin Transformer**  
+  https://github.com/microsoft/Swin-Transformer
+  https://arxiv.org/abs/2103.14030
+
+- **PyTorch Lightning**  
+  https://github.com/Lightning-AI/pytorch-lightning
+  https://lightning.ai/
+
+- **NT-Xent / SimCLR**  
+  https://github.com/google-research/simclr
+  https://arxiv.org/abs/2002.05709
+
+We gratefully acknowledge these projects for making this work possible.
 
 
 ## Contact
