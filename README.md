@@ -1,8 +1,8 @@
 # R2T‑Net
 
-**R2T-Net** is a PyTorch-Lightning framework that transforms paired 4-D fMRI samples—**resting-state (rs-fMRI)** and **task-based (t-fMRI)**—into a unified **2048-dimensional dynamic brain activity signature**.
+**R2T-Net** is a PyTorch-Lightning framework that transforms paired 4-D fMRI samples—**resting-state (rs-fMRI)** and **task-based (t-fMRI)**—into a unified **1024-dimensional dynamic brain activity signature**.
 
-For each subject, the model encodes both rs-fMRI and t-fMRI separately into their own 2048-D latent vectors. During training, it uses a **contrastive learning objective** to make the two representations of the *same subject* align, while ensuring they remain distinct from those of *other subjects*.
+For each subject, the model encodes both rs-fMRI and t-fMRI separately into their own 1024-D latent vectors. During training, it uses a **contrastive learning objective** to make the two representations of the *same subject* align, while ensuring they remain distinct from those of *other subjects*.
 
 A Transformer encoder generates the signatures (**Step 1**), and an **NT-Xent contrastive loss** enforces the alignment and separation (**Step 2**).
 A lightweight supervised head can optionally be added to predict cognitive or behavioural traits from these signatures.
@@ -181,3 +181,7 @@ python train.py \
   --temporal_crop_min_ratio 0.8 --gaussian_noise_std 0.01 \
   --gaussian_noise_p 0.1 --modality_dropout_prob 0.2
 ```
+
+## Contact
+
+If you have any questions regarding this work, please send email to y2jiang@polyu.edu.hk.
