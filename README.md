@@ -193,11 +193,9 @@ This work is inspired by and builds upon the following open-source projects and 
 
 - **SwiFT (Swin 4D fMRI Transformer)**  
   https://github.com/Transconnectome/SwiFT  
-  https://transconnectome.github.io/SwiFT/
 
 - **SwiFUN (Swin fMRI UNet Transformer)**  
   https://github.com/Transconnectome/SwiFUN  
-  https://transconnectome.github.io/SwiFUN/
 
 - **Swin Transformer**  
   https://github.com/microsoft/Swin-Transformer  
