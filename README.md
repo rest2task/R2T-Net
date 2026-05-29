@@ -1,217 +1,286 @@
-# R2T‑Net
+# R2T-Net
 
-**R2T-Net** is a PyTorch-Lightning framework that transforms paired 4-D fMRI samples—**resting-state (rs-fMRI)** and **task-based (t-fMRI)**—into a unified **1024-dimensional dynamic brain activity signature**.
+R2T-Net maps rest/task fMRI windows into a 1024-D subject signature and trains
+that signature against cognitive scores.  The repo uses plain PyTorch.  No
+Lightning wrapper.
 
-For each subject, the model encodes both rs-fMRI and t-fMRI separately into their own 1024-D latent vectors. During training, it uses a **contrastive learning objective** to make the two representations of the *same subject* align, while ensuring they remain distinct from those of *other subjects*.
+## Layout
 
-A Transformer encoder generates the signatures (**Step 1**), and an **NT-Xent contrastive loss** enforces the alignment and separation (**Step 2**).
-A lightweight supervised head can optionally be added to predict cognitive or behavioural traits from these signatures.
-
-A test script, `extract.py`, allows direct extraction of these signatures from a trained checkpoint.
-
-
-## Motivation
-
-Traditional pipelines handle rs‑fMRI and t‑fMRI separately, often compressing t‑fMRI into static contrast maps—losing temporal dynamics and personalization.  
-**R2T‑Net** instead:
-
-* Learns a **modality‑invariant** embedding (rest ⇄ task).  
-* Produces **person‑specific** vectors (positive pairs = same subject). 
-
-
-## Backbone Flexibility
-
-Edit one line in `module/models/load_model.py` to plug in any encoder that outputs a `[B, embed_dim]` feature:
-
-| Category           | Examples |
-|--------------------|----------|
-| Transformer‑4D     | `swin4d_ver7` (default) ·  ViT · TimeSformer |
-| 3‑D CNN            | 3‑D ResNet, 3‑D DenseNet, UNet‑3D |
-| Hybrid             | CNN + GRU, Perceiver IO, Temporal‑U‑Net |
-
-
-## Directory Layout
-
+```text
+R2T-Net/
+├── train.py
+├── prepare_data.py
+├── inference.py
+├── extract.py
+├── studies/
+├── scripts/
+├── r2tnet/
+│   └── backbones/
+└── manuscript/
 ```
 
-R2TNet/
-├── train.py                # train / validate / test
-├── inference.py            # batch inference on rs‑fMRI
-│
-├── module/
-│   ├── r2tnet.py           # LightningModule (encoder + heads + losses)
-│   ├── models/
-│   │   ├── load_model.py
-│   │   ├── swin4d_transformer_ver7.py
-│   │   └── swin_transformer.py
-│   └── utils/
-│       ├── data_module.py
-│       ├── datasets.py
-│       ├── patch_embedding.py
-│       └── lr_scheduler.py
-│
-└── logs/                   # auto‑generated (TensorBoard & checkpoints)
+## Data Contract
 
-````
+Training never reads HCP/CHCP/ADNI source files directly.  Convert sources to
+per-TR tensors first.  The current manifest format is line-delimited JSON; CSV
+manifests from older runs are still readable, but new data should use this:
 
-
-## Quick Start
-
-Train and evaluate on 4D fMRI, ROI series, or grayordinates — all from one CLI.
-
-
-### 1 · Install
-
-```bash
-# PyTorch 2.x with CUDA 11.8
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-
-# Core dependencies
-pip install pytorch-lightning timm einops torchmetrics scikit-learn
-
-# Optional extras
-pip install monai pandas matplotlib
-```
-
-
-### 2 · Prepare your data
-
-```
-data/S1200/
-├── img/
-│   ├── 100307/
-│   │   ├── frame_0.pt
-│   │   ├── frame_1.pt
-│   │   └── ...
-│   └── 103414/
+```text
+data/<experiment>/
+├── blocks/
+│   └── <subject>/<scan_id>/frame_0.pt
 └── meta/
-    ├── subject_dict.json        # {"100307": [0, 83.2], ...}
-    └── splits.json              # {"train": [...], "val": [...], "test": [...]}
+    ├── dataset.json
+    ├── subjects.jsonl
+    └── scans.jsonl
 ```
 
-* Each `frame_*.pt` is a tensor shaped `[C, H, W, D]` (for 4D fMRI).
-* ROIs or grayordinates should be saved as `[V]` tensors per frame.
-* Optional: `voxel_mean.pt` and `voxel_std.pt` for normalization.
+`meta/dataset.json`
 
+```json
+{
+  "schema": "r2t.manifest.v2",
+  "study": "hcp",
+  "source_root": "/nfshdd/y2jiang/HCP_1200",
+  "targets": ["wm_0bk", "wm_2bk", "wm_diff", "rel"]
+}
+```
 
-#### 2a · Convert NIfTI volumes (HCP example)
+`meta/subjects.jsonl`
 
-The repository ships two helper scripts that dump each fMRI time point into the layout above. Both scripts normalise the data, crop empty borders (adjust inside the script if your acquisition differs), and skip subjects that are already processed.
+```json
+{"id":"100206","split":"train","sex":0,"targets":{"wm_0bk":0.91,"wm_2bk":0.83,"wm_diff":-0.08,"rel":0.88,"rt_wm":721.4,"rt_rel":812.0}}
+```
+
+`meta/scans.jsonl`
+
+```json
+{"id":"100206:REST1_LR","subject":"100206","scan":"REST1_LR","role":"rest","kind":"grayord","frames":"blocks/100206/REST1_LR","n_frames":1200,"source":"/nfshdd/.../rfMRI_REST1_LR_Atlas_MSMAll_hp2000_clean.dtseries.nii"}
+{"id":"100206:WM_LR","subject":"100206","scan":"WM_LR","role":"task","kind":"grayord","frames":"blocks/100206/WM_LR","n_frames":405,"source":"/nfshdd/.../tfMRI_WM_LR_Atlas_MSMAll.dtseries.nii"}
+```
+
+`kind`
+
+```text
+vol      RAW 4D NIfTI        frame_i.pt = [1, X, Y, Z]
+grayord  CIFTI dtseries      frame_i.pt = [91282]
+roi      CIFTI + parcellation frame_i.pt = [V]
+```
+
+## Prepare
+
+Create empty manifests:
 
 ```bash
-# Resting-state window (default file: rfMRI_REST1_LR_hp2000_clean.nii.gz)
-python preprocessing_HCP_Rest.py \
-  --load-root /path/to/HCP_1200 \
-  --save-root data/S1200 \
-  --expected-length 1200
-
-# Task run (default file: tfMRI_WM_LR.nii.gz)
-python preprocessing_HCP_Task.py \
-  --load-root /path/to/HCP_1200 \
-  --save-root data/S1200 \
-  --expected-length 405
+python prepare_data.py init --data-dir data/hcp_grayord
 ```
 
-Key flags:
+Convert rows in `meta/scans.jsonl`:
 
-* `--nifti-name` — override the file name inside each subject folder (e.g. use `tfMRI_REL_LR.nii.gz` for relational reasoning).
-* `--scaling-method {minmax,z-norm}` — choose intensity scaling.
-* `--keep-min-background` — fill background voxels with the minimum foreground value instead of zero.
+```bash
+python prepare_data.py convert \
+  --data-dir data/hcp_grayord \
+  --normalise zscore \
+  --dtype float16
+```
 
-The scripts populate `data/S1200/img/<subject>/frame_*.pt` in fp16 format and create an empty `data/S1200/meta/` directory for metadata files (`subject_dict.json`, `splits.json`).
+Parcellated mode:
 
+```bash
+python prepare_data.py convert \
+  --data-dir data/hcp_mmp \
+  --parcellation-atlas atlas/MMP.dlabel.nii \
+  --wb-command wb_command
+```
 
-### 3 · Training Paradigms
+## Modes
 
-| Mode                | NT-Xent | Supervised | CLI Flags                                                |
-| ------------------- | ------- | ---------- | -------------------------------------------------------- |
-| **Self-supervised** | ✅       | ❌ (frozen) | `--contrastive --pretraining --freeze_head`              |
-| **Full fine-tune**  | ✅       | ✅          | `--contrastive` *(default)*                              |
+```text
+--training_mode r2t             paired rest/task, contrastive + supervised
+--training_mode rest_only       rest windows only
+--training_mode task_only       task windows only
+--training_mode synthetic_task  rest signature mapped toward task signature
 
-> ⚠️ Omitting `--contrastive` disables NT-Xent loss.
+--pretraining                   contrastive only
+--freeze_encoder                train prediction head only
+--supervised_view rest|task|average
+--pair_fusion auto|rest|task|average|sum|concat|gated
+--disable_contrastive
+--optimizer adamw|adam|sgd|rmsprop
+--scheduler none|cosine|step|onecycle --warmup_epochs 50 --lr_min 1e-5
+--modality_dropout_p 0.2
+--selection_metric alignment --early_stop_patience 5
+--synthetic_mapper cmt --synthetic_depth 2 --synthetic_heads 8
+```
 
+Backbone/objective switches:
 
-### 4 · Example Commands
+```text
+--temporal_encoder vit|gru|conv|mean
+--contrastive_loss ntxent|symmetric_ce|cosine|margin
+--reg_head yolo|mlp|linear
+--reg_loss huber|mse|l1
+--temporal_mask_p 0.05 --feature_mask_p 0.05
+```
 
-#### A. Self-supervised Pre-training
+Named heads share the same encoder and 1024-D signature.  The grammar is:
+
+```text
+--head_spec name:target_a,target_b[:regression|classification[:weight]];...
+```
+
+Examples:
+
+```bash
+--target_cols wm_0bk,wm_2bk,wm_diff,rel \
+--head_spec 'score:wm_0bk,wm_2bk:regression:1.0;contrast:wm_diff,rel:regression:0.5'
+
+--target_cols wm_0bk,wm_2bk,rt_wm,rt_rel \
+--head_spec 'score:wm_0bk,wm_2bk:regression:1.0;rt:rt_wm,rt_rel:regression:0.25'
+```
+
+## Manuscript Studies
+
+The model-side study entry points are split by cohort.
+
+```bash
+python -m studies.hcp
+python -m studies.hcp --mode r2t --representation grayord
+python -m studies.chcp --ckpt runs/hcp_grayord_r2t/last.pt
+python -m studies.adni --ckpt runs/hcp_raw4d_r2t/last.pt
+```
+
+Model-comparison grids have direct launchers:
+
+```bash
+python -m studies.hcp_modality
+python -m studies.hcp_representation
+python -m studies.hcp_length_dim
+python -m studies.hcp_seed_grid --tests
+python -m studies.model_space --suite all --csv runs/model_space.csv
+python -m studies.hcp_encoder_space
+python -m studies.hcp_objective_space
+python -m studies.hcp_head_space
+python -m studies.hcp_fusion_space
+python -m studies.hcp_optim_space
+python -m studies.hcp_regularization_space
+python -m studies.hcp_synthetic_space
+python -m studies.hcp_size_space
+```
+
+Raw model artifacts:
+
+```bash
+python -m studies.artifacts manifest --data-dir data/hcp_grayord --target-cols wm_0bk,wm_2bk,wm_diff,rel
+python -m studies.artifacts alignment --ckpt runs/hcp_grayord_r2t/last.pt --data-dir data/hcp_grayord --target-cols wm_0bk,wm_2bk,wm_diff,rel --output runs/artifacts/alignment.csv
+python -m studies.artifacts saliency --ckpt runs/hcp_grayord_r2t/last.pt --data-dir data/hcp_grayord --target-cols wm_0bk,wm_2bk,wm_diff,rel --target-index 0 --output runs/artifacts/saliency.pt
+```
+
+Script shortcuts:
+
+```bash
+bash scripts/hcp_manifest.sh
+bash scripts/hcp_study.sh --representation all
+bash scripts/chcp_study.sh
+bash scripts/adni_study.sh
+bash scripts/hcp_train_grayord.sh
+bash scripts/hcp_modality.sh --tests
+bash scripts/hcp_encoder_space.sh
+bash scripts/hcp_artifacts.sh
+```
+
+HCP source patterns expected under `/nfshdd/y2jiang/HCP_1200/<subject>/`:
+
+```text
+rfMRI_REST{1,2}_{LR,RL}_Atlas_MSMAll_hp2000_clean.dtseries.nii
+tfMRI_WM_{LR,RL}_Atlas_MSMAll.dtseries.nii
+tfMRI_RELATIONAL_{LR,RL}_Atlas_MSMAll.dtseries.nii
+```
+
+CHCP source patterns expected under `/nfshdd/y2jiang/CHCP_DB/<subject>/`:
+
+```text
+rfMRI_REST{1,2}_{AP,PA}_Atlas_hp2000_clean.dtseries.nii
+tfMRI_WM_*Atlas*.dtseries.nii
+tfMRI_RELATIONAL_*Atlas*.dtseries.nii
+```
+
+ADNI is treated as rest-only transfer, RAW 4D windows.  Use a prepared manifest
+with dummy target columns if only clinical labels are available.
+
+## Train
+
+R2T grayordinate:
 
 ```bash
 python train.py \
-  --data_dir data/S1200 \
-  --dataset_type rest \
-  --contrastive --pretraining --freeze_head \
-  --model swin4d_ver7 \
-  --batch_size 4 --max_epochs 2000 \
-  --use_scheduler --total_steps 20000
+  --data_dir data/hcp_grayord \
+  --training_mode r2t \
+  --eval_role rest \
+  --sequence_length 300 \
+  --signature_dim 1024 \
+  --batch_size 16 \
+  --max_epochs 1600 \
+  --out_dir runs/hcp_r2t
 ```
 
-#### Multi-GPU (DDP) Training
-
-Enable distributed training by requesting multiple devices. The trainer defaults to `ddp` when more than one device is set, and
-the data module automatically switches to distributed samplers.
+Rest-only baseline:
 
 ```bash
 python train.py \
-  --data_dir data/S1200 \
-  --dataset_type rest \
-  --contrastive \
-  --model swin4d_ver7 \
-  --batch_size 4 --max_epochs 100 \
-  --accelerator gpu --devices 4 --precision 16
+  --data_dir data/hcp_grayord \
+  --training_mode rest_only \
+  --eval_role rest \
+  --disable_contrastive \
+  --sequence_length 300 \
+  --out_dir runs/rest_only
 ```
 
-#### B. Fine-tune with Labels (Regression)
+Frozen-signature fine-tune:
 
 ```bash
 python train.py \
-  --data_dir data/S1200 \
-  --dataset_type rest \
-  --contrastive \
-  --load_model logs/last.ckpt \
-  --downstream_task_type regression \
-  --label_scaling_method standardization \
-  --model swin4d_ver7 \
-  --batch_size 4 --max_epochs 100 --use_scheduler \
-  --temporal_crop_min_ratio 0.8 --gaussian_noise_std 0.01 \
-  --gaussian_noise_p 0.1 --modality_dropout_prob 0.2
+  --data_dir data/hcp_grayord \
+  --training_mode r2t \
+  --resume runs/pretrain/last.pt \
+  --freeze_encoder \
+  --supervised_view rest \
+  --max_epochs 100 \
+  --out_dir runs/finetune
 ```
 
+DDP:
 
-## Acknowledgments
+```bash
+torchrun --nproc_per_node=4 train.py \
+  --ddp \
+  --data_dir data/hcp_grayord \
+  --training_mode r2t \
+  --batch_size 8 \
+  --out_dir runs/ddp_r2t
+```
 
-This work is inspired by and builds upon the following open-source projects and resources:
+## Test
 
-- **SwiFT (Swin 4D fMRI Transformer)**  
-  https://github.com/Transconnectome/SwiFT
+```bash
+python train.py \
+  --data_dir data/hcp_grayord \
+  --resume runs/hcp_r2t/last.pt \
+  --test_only \
+  --eval_role rest
+```
 
-- **SwiFUN (Swin fMRI UNet Transformer)**  
-  https://github.com/Transconnectome/SwiFUN
+Test output reports window correlations and subject-averaged correlations.
 
-## Acknowledgments
+## Extract / Infer
 
-This work is inspired by and builds upon the following open-source projects and resources:
+`inference.py` expects complete clips, not frame folders:
 
-- **SwiFT (Swin 4D fMRI Transformer)**  
-  https://github.com/Transconnectome/SwiFT  
+```text
+clip.pt = [V,T] or [1,X,Y,Z,T]
+```
 
-- **SwiFUN (Swin fMRI UNet Transformer)**  
-  https://github.com/Transconnectome/SwiFUN  
-
-- **Swin Transformer**  
-  https://github.com/microsoft/Swin-Transformer  
-  https://arxiv.org/abs/2103.14030
-
-- **PyTorch Lightning**  
-  https://github.com/Lightning-AI/pytorch-lightning  
-  https://lightning.ai/
-
-- **NT-Xent / SimCLR**  
-  https://github.com/google-research/simclr  
-  https://arxiv.org/abs/2002.05709
-
-We gratefully acknowledge these projects for making this work possible.
-
-
-## Contact
-
-If you have any questions regarding this work, please send email to y2jiang@polyu.edu.hk.
+```bash
+python inference.py --ckpt runs/hcp_r2t/last.pt --input_dir clips/rest --role rest
+python extract.py --ckpt runs/hcp_r2t/last.pt --rest_dir clips/rest --rest_only
+```
