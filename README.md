@@ -2,13 +2,6 @@
 
 R2T-Net (Rest-to-Task Network) is a transformer-based framework for integrating resting-state and task fMRI into a shared 1,024-dimensional neural activity signature that preserves individual-specific brain patterns while aligning rest and task representations from the same person. It is trained on paired rest/task scans to learn this shared signature, then used to predict individual cognitive performance from resting-state data alone at test time, which makes it useful for settings where task scans are unavailable or difficult to collect. The implementation in this repository supports the full workflow, including data preparation, paired and single-modality training, transfer to independent datasets, inference on complete clips, signature extraction, and the analysis scripts used for HCP, CHCP, and ADNI.
 
-## At A Glance
-
-- It supports rest, task, and paired rest/task fMRI training.
-- It works with raw 4D volumes, grayordinate CIFTI data, and parcellated ROI data.
-- It was evaluated in the manuscript on HCP, CHCP, and ADNI.
-- The main output is a 1,024-dimensional subject signature used for prediction and analysis.
-
 ## Repository Layout
 
 ```text
@@ -21,7 +14,6 @@ R2T-Net/
 ├── scripts/
 ├── r2tnet/
 │   └── backbones/
-└── manuscript/
 ```
 
 ## Data Format
@@ -140,7 +132,7 @@ Examples:
 --head_spec 'score:wm_0bk,wm_2bk:regression:1.0;rt:rt_wm,rt_rel:regression:0.25'
 ```
 
-## Manuscript Studies
+## Studies
 
 Study entry points are split by cohort:
 
