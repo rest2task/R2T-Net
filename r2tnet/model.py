@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import random
 import argparse
+import math
 from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser
 from dataclasses import dataclass
 from typing import Dict, List, Sequence, Tuple
@@ -382,6 +383,27 @@ class R2TNet(nn.Module):
         self.pred_head = MultiTaskHead(self.signature_dim, targets_np, self.target_names, specs, hparams)
         self.pair_concat = nn.Sequential(nn.LayerNorm(self.signature_dim * 2), nn.Linear(self.signature_dim * 2, self.signature_dim))
         self.pair_gate = nn.Sequential(nn.LayerNorm(self.signature_dim * 2), nn.Linear(self.signature_dim * 2, self.signature_dim), nn.Sigmoid())
+        projector = hparams.get("contrastive_projector", "none")
+        contrast_dim = int(hparams.get("contrastive_dim", 0) or self.signature_dim)
+        hidden_dim = int(hparams.get("contrastive_projector_hidden", 0) or self.signature_dim)
+        if projector == "linear":
+            self.contrastive_projector = nn.Linear(self.signature_dim, contrast_dim)
+            self.contrastive_dim = contrast_dim
+        elif projector == "mlp":
+            self.contrastive_projector = nn.Sequential(
+                nn.LayerNorm(self.signature_dim),
+                nn.Linear(self.signature_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, contrast_dim),
+            )
+            self.contrastive_dim = contrast_dim
+        else:
+            self.contrastive_projector = nn.Identity()
+            self.contrastive_dim = self.signature_dim
+        queue_size = int(hparams.get("contrastive_queue_size", 0) or 0)
+        self.register_buffer("contrastive_queue", torch.empty(queue_size, self.contrastive_dim))
+        self.register_buffer("contrastive_queue_ptr", torch.zeros((), dtype=torch.long))
+        self.register_buffer("contrastive_queue_fill", torch.zeros((), dtype=torch.long))
 
         if hparams.get("freeze_encoder", False):
             for module in (self.swift_encoder, self.temporal_vit, self.temporal_gru, self.temporal_conv, self.temporal_mean, self.modality_emb):
@@ -410,29 +432,198 @@ class R2TNet(nn.Module):
     def inverse_scale(self, prediction):
         return self.pred_head.inverse_scale(prediction)
 
-    def _contrastive_loss(self, rest, task):
-        rest = F.normalize(rest, dim=1)
-        task = F.normalize(task, dim=1)
-        loss_name = self.hparams.get("contrastive_loss", "ntxent")
-        if loss_name == "cosine":
-            return 1.0 - F.cosine_similarity(rest, task, dim=1).mean()
-        embeddings = torch.cat([rest, task], dim=0)
-        sim = torch.matmul(embeddings, embeddings.t()) / self.hparams.get("temperature", 0.07)
+    def _contrastive_views(self, rest, task):
+        return self.contrastive_projector(rest), self.contrastive_projector(task)
+
+    def _contrastive_queue(self):
+        fill = int(self.contrastive_queue_fill.item()) if self.contrastive_queue.numel() else 0
+        if fill <= 0:
+            return None
+        return F.normalize(self.contrastive_queue[:fill], dim=1)
+
+    @torch.no_grad()
+    def _enqueue_contrastive(self, rest, task):
+        if self.contrastive_queue.numel() == 0 or not self.training:
+            return
+        values = F.normalize(torch.cat([rest, task], dim=0), dim=1).detach()
+        size = self.contrastive_queue.size(0)
+        if values.size(0) >= size:
+            self.contrastive_queue.copy_(values[-size:])
+            self.contrastive_queue_ptr.zero_()
+            self.contrastive_queue_fill.fill_(size)
+            return
+        ptr = int(self.contrastive_queue_ptr.item())
+        end = ptr + values.size(0)
+        if end <= size:
+            self.contrastive_queue[ptr:end].copy_(values)
+        else:
+            first = size - ptr
+            self.contrastive_queue[ptr:].copy_(values[:first])
+            self.contrastive_queue[: end - size].copy_(values[first:])
+        self.contrastive_queue_ptr.fill_(end % size)
+        self.contrastive_queue_fill.fill_(min(size, int(self.contrastive_queue_fill.item()) + values.size(0)))
+
+    def _contrastive_labels(self, batch, device):
+        return torch.cat([torch.arange(batch, 2 * batch, device=device), torch.arange(batch, device=device)])
+
+    def _target_false_negative_mask(self, target, batch, device):
+        quantile = float(self.hparams.get("contrastive_target_mask_quantile", 0.0) or 0.0)
+        if target is None or quantile <= 0.0 or batch <= 1:
+            return None
+        target = target.detach().float().to(device)
+        if target.ndim == 1:
+            target = target.unsqueeze(1)
+        dist = torch.cdist(target, target)
+        eye = torch.eye(batch, device=device, dtype=torch.bool)
+        values = dist.masked_select(~eye)
+        if values.numel() == 0:
+            return None
+        cutoff = torch.quantile(values, min(max(quantile, 0.0), 1.0))
+        similar = (dist <= cutoff) & ~eye
+        subject_idx = torch.cat([torch.arange(batch, device=device), torch.arange(batch, device=device)])
+        mask = similar[subject_idx[:, None], subject_idx[None, :]]
+        labels = self._contrastive_labels(batch, device)
+        mask[torch.arange(2 * batch, device=device), labels] = False
+        mask.fill_diagonal_(False)
+        return mask
+
+    def _apply_target_mask(self, sim, target, batch):
+        mask = self._target_false_negative_mask(target, batch, sim.device)
+        if mask is not None:
+            sim = sim.clone()
+            sim[:, : 2 * batch] = sim[:, : 2 * batch].masked_fill(mask, float("-inf"))
+        return sim
+
+    def _contrast_candidates(self, embeddings):
+        queue = self._contrastive_queue()
+        return torch.cat([embeddings, queue], dim=0) if queue is not None else embeddings
+
+    def _info_nce_loss(self, rest, task, target, hard_topk = None):
         batch = rest.size(0)
-        if loss_name == "margin":
-            raw = torch.matmul(torch.cat([rest, task], dim=0), torch.cat([rest, task], dim=0).t())
-            pos = torch.cat([torch.diag(raw, batch), torch.diag(raw, -batch)])
-            neg = raw.masked_fill(torch.eye(2 * batch, device=raw.device, dtype=torch.bool), float("-inf"))
-            neg = neg.masked_fill(torch.roll(torch.eye(2 * batch, device=raw.device, dtype=torch.bool), shifts=batch, dims=1), float("-inf"))
-            hardest = neg.max(dim=1).values
-            return F.relu(self.hparams.get("contrastive_margin", 0.2) - pos + hardest).mean()
+        embeddings = torch.cat([rest, task], dim=0)
+        candidates = self._contrast_candidates(embeddings)
+        sim = torch.matmul(embeddings, candidates.t()) / self.hparams.get("temperature", 0.07)
         sim = sim.masked_fill(torch.eye(2 * batch, device=sim.device, dtype=torch.bool), float("-inf"))
-        labels = torch.cat([torch.arange(batch, 2 * batch, device=sim.device), torch.arange(batch, device=sim.device)])
-        if loss_name == "symmetric_ce":
-            left = F.cross_entropy(sim[:batch, batch:], torch.arange(batch, device=sim.device))
-            right = F.cross_entropy(sim[batch:, :batch], torch.arange(batch, device=sim.device))
-            return 0.5 * (left + right)
-        return F.cross_entropy(sim, labels)
+        sim = self._apply_target_mask(sim, target, batch)
+        labels = self._contrastive_labels(batch, sim.device)
+        if hard_topk is None:
+            return F.cross_entropy(sim, labels)
+        pos = sim[torch.arange(2 * batch, device=sim.device), labels]
+        neg = sim.clone()
+        neg[torch.arange(2 * batch, device=sim.device), labels] = float("-inf")
+        finite = torch.isfinite(neg)
+        if not bool(finite.any()):
+            return pos.sum() * 0.0
+        k = min(max(int(hard_topk), 1), int(finite.sum(dim=1).max().item()))
+        hard = neg.topk(k, dim=1).values
+        logits = torch.cat([pos.unsqueeze(1), hard], dim=1)
+        return F.cross_entropy(logits, torch.zeros(2 * batch, device=sim.device, dtype=torch.long))
+
+    def _symmetric_ce_loss(self, rest, task, target):
+        batch = rest.size(0)
+        queue = self._contrastive_queue()
+        rest_candidates = torch.cat([task, queue], dim=0) if queue is not None else task
+        task_candidates = torch.cat([rest, queue], dim=0) if queue is not None else rest
+        left = torch.matmul(rest, rest_candidates.t()) / self.hparams.get("temperature", 0.07)
+        right = torch.matmul(task, task_candidates.t()) / self.hparams.get("temperature", 0.07)
+        mask = self._target_false_negative_mask(target, batch, rest.device)
+        if mask is not None:
+            left = left.clone()
+            right = right.clone()
+            left[:, :batch] = left[:, :batch].masked_fill(mask[:batch, batch:], float("-inf"))
+            right[:, :batch] = right[:, :batch].masked_fill(mask[batch:, :batch], float("-inf"))
+        labels = torch.arange(batch, device=rest.device)
+        return 0.5 * (F.cross_entropy(left, labels) + F.cross_entropy(right, labels))
+
+    def _margin_loss(self, rest, task, target):
+        batch = rest.size(0)
+        embeddings = torch.cat([rest, task], dim=0)
+        candidates = self._contrast_candidates(embeddings)
+        raw = torch.matmul(embeddings, candidates.t())
+        raw = raw.masked_fill(torch.eye(2 * batch, device=raw.device, dtype=torch.bool), float("-inf"))
+        raw = self._apply_target_mask(raw, target, batch)
+        labels = self._contrastive_labels(batch, raw.device)
+        pos = raw[torch.arange(2 * batch, device=raw.device), labels]
+        neg = raw.clone()
+        neg[torch.arange(2 * batch, device=raw.device), labels] = float("-inf")
+        hardest = neg.max(dim=1).values
+        valid = torch.isfinite(hardest)
+        if not bool(valid.any()):
+            return pos.sum() * 0.0
+        return F.relu(self.hparams.get("contrastive_margin", 0.2) - pos[valid] + hardest[valid]).mean()
+
+    def _debiased_contrastive_loss(self, rest, task, target):
+        batch = rest.size(0)
+        embeddings = torch.cat([rest, task], dim=0)
+        candidates = self._contrast_candidates(embeddings)
+        sim = torch.matmul(embeddings, candidates.t()) / self.hparams.get("temperature", 0.07)
+        labels = self._contrastive_labels(batch, sim.device)
+        pos_sim = sim[torch.arange(2 * batch, device=sim.device), labels]
+        pos = torch.exp(pos_sim)
+        neg_sim = sim.masked_fill(torch.eye(2 * batch, device=sim.device, dtype=torch.bool), float("-inf"))
+        neg_sim[torch.arange(2 * batch, device=sim.device), labels] = float("-inf")
+        neg_sim = self._apply_target_mask(neg_sim, target, batch)
+        finite = torch.isfinite(neg_sim)
+        neg = torch.exp(neg_sim.masked_fill(~finite, float("-inf"))).masked_fill(~finite, 0.0).sum(dim=1)
+        n_neg = finite.sum(dim=1).clamp_min(1).to(neg.dtype)
+        tau_plus = float(self.hparams.get("contrastive_tau_plus", 0.1))
+        temperature = float(self.hparams.get("temperature", 0.07))
+        debiased = (-tau_plus * n_neg * pos + neg) / max(1.0 - tau_plus, 1e-6)
+        debiased = debiased.clamp_min(n_neg * math.exp(-1.0 / temperature))
+        return (-torch.log(pos / (pos + debiased + 1e-12))).mean()
+
+    def _barlow_twins_loss(self, rest, task):
+        batch = rest.size(0)
+        rest = (rest - rest.mean(dim=0)) / rest.std(dim=0, unbiased=False).clamp_min(1e-4)
+        task = (task - task.mean(dim=0)) / task.std(dim=0, unbiased=False).clamp_min(1e-4)
+        corr = torch.matmul(rest.t(), task) / max(batch, 1)
+        diag = torch.diagonal(corr).add(-1.0).pow(2).sum()
+        off = corr.flatten()[:-1].view(corr.size(0) - 1, corr.size(0) + 1)[:, 1:].flatten().pow(2).sum()
+        return diag + self.hparams.get("contrastive_barlow_lambda", 0.005) * off
+
+    def _vicreg_loss(self, rest, task):
+        repr_loss = F.mse_loss(rest, task)
+        rest_std = torch.sqrt(rest.var(dim=0, unbiased=False) + 1e-4)
+        task_std = torch.sqrt(task.var(dim=0, unbiased=False) + 1e-4)
+        std_loss = 0.5 * (F.relu(1.0 - rest_std).mean() + F.relu(1.0 - task_std).mean())
+        denom = max(rest.size(0) - 1, 1)
+        rest = rest - rest.mean(dim=0)
+        task = task - task.mean(dim=0)
+        rest_cov = torch.matmul(rest.t(), rest) / denom
+        task_cov = torch.matmul(task.t(), task) / denom
+        rest_off = rest_cov.flatten()[:-1].view(rest_cov.size(0) - 1, rest_cov.size(0) + 1)[:, 1:].flatten()
+        task_off = task_cov.flatten()[:-1].view(task_cov.size(0) - 1, task_cov.size(0) + 1)[:, 1:].flatten()
+        cov_loss = (rest_off.pow(2).sum() + task_off.pow(2).sum()) / rest.size(1)
+        return (
+            self.hparams.get("vicreg_sim_coeff", 25.0) * repr_loss
+            + self.hparams.get("vicreg_std_coeff", 25.0) * std_loss
+            + self.hparams.get("vicreg_cov_coeff", 1.0) * cov_loss
+        )
+
+    def _contrastive_loss(self, rest, task, target = None):
+        rest_z, task_z = self._contrastive_views(rest, task)
+        loss_name = self.hparams.get("contrastive_loss", "ntxent")
+        if loss_name == "barlow_twins":
+            return self._barlow_twins_loss(rest_z, task_z)
+        if loss_name == "vicreg":
+            return self._vicreg_loss(rest_z, task_z)
+
+        rest_z = F.normalize(rest_z, dim=1)
+        task_z = F.normalize(task_z, dim=1)
+        if loss_name == "cosine":
+            loss = 1.0 - F.cosine_similarity(rest_z, task_z, dim=1).mean()
+        elif loss_name in {"symmetric_ce", "clip"}:
+            loss = self._symmetric_ce_loss(rest_z, task_z, target)
+        elif loss_name in {"margin", "triplet"}:
+            loss = self._margin_loss(rest_z, task_z, target)
+        elif loss_name in {"dcl", "debiased"}:
+            loss = self._debiased_contrastive_loss(rest_z, task_z, target)
+        elif loss_name in {"hard_ntxent", "hard_infonce"}:
+            loss = self._info_nce_loss(rest_z, task_z, target, self.hparams.get("hard_negative_topk", 16))
+        else:
+            loss = self._info_nce_loss(rest_z, task_z, target)
+        self._enqueue_contrastive(rest_z, task_z)
+        return loss
 
     def supervised_loss(self, head_out, target):
         loss, _ = self.pred_head.loss(head_out, target, self.hparams)
@@ -500,7 +691,7 @@ class R2TNet(nn.Module):
         rest_sig = self.encode(rest, rest_mod)
         task_sig = self.encode(task, task_mod)
         zero = rest_sig.new_zeros(())
-        con = self._contrastive_loss(rest_sig, task_sig) if not self.hparams.get("disable_contrastive", False) else zero
+        con = self._contrastive_loss(rest_sig, task_sig, batch.get("target")) if not self.hparams.get("disable_contrastive", False) else zero
 
         synth = zero
         if self.hparams.get("training_mode") == "synthetic_task":
@@ -563,8 +754,38 @@ class R2TNet(nn.Module):
         train.add_argument("--synthetic_tokens", type=int, default=4)
         train.add_argument("--synthetic_dropout", type=float, default=0.1)
         train.add_argument("--temperature", type=float, default=0.07)
-        train.add_argument("--contrastive_loss", choices=["ntxent", "symmetric_ce", "cosine", "margin"], default="ntxent")
+        train.add_argument(
+            "--contrastive_loss",
+            choices=[
+                "ntxent",
+                "infonce",
+                "simclr",
+                "symmetric_ce",
+                "clip",
+                "cosine",
+                "margin",
+                "triplet",
+                "hard_ntxent",
+                "hard_infonce",
+                "dcl",
+                "debiased",
+                "barlow_twins",
+                "vicreg",
+            ],
+            default="ntxent",
+        )
         train.add_argument("--contrastive_margin", type=float, default=0.2)
+        train.add_argument("--contrastive_projector", choices=["none", "linear", "mlp"], default="none")
+        train.add_argument("--contrastive_dim", type=int, default=0, help="Projection dimension; 0 keeps signature_dim")
+        train.add_argument("--contrastive_projector_hidden", type=int, default=0, help="MLP projector hidden dim; 0 keeps signature_dim")
+        train.add_argument("--contrastive_queue_size", type=int, default=0, help="Cross-batch memory queue size for negative-based losses")
+        train.add_argument("--hard_negative_topk", type=int, default=16)
+        train.add_argument("--contrastive_tau_plus", type=float, default=0.1, help="Class-prior estimate for debiased contrastive loss")
+        train.add_argument("--contrastive_target_mask_quantile", type=float, default=0.0, help="Mask closest target-neighbor negatives within a batch")
+        train.add_argument("--contrastive_barlow_lambda", type=float, default=0.005)
+        train.add_argument("--vicreg_sim_coeff", type=float, default=25.0)
+        train.add_argument("--vicreg_std_coeff", type=float, default=25.0)
+        train.add_argument("--vicreg_cov_coeff", type=float, default=1.0)
         train.add_argument("--temporal_crop_min_ratio", type=float, default=0.8)
         train.add_argument("--gaussian_noise_std", type=float, default=0.01)
         train.add_argument("--gaussian_noise_p", type=float, default=0.1)

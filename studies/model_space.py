@@ -70,8 +70,14 @@ def objective_suite():
     return [
         Run("objective", "ntxent", Path("runs/space_objective/ntxent"), ["--contrastive_loss", "ntxent"]),
         Run("objective", "sym_ce", Path("runs/space_objective/sym_ce"), ["--contrastive_loss", "symmetric_ce"]),
+        Run("objective", "clip", Path("runs/space_objective/clip"), ["--contrastive_loss", "clip", "--contrastive_projector", "mlp", "--contrastive_dim", "256"]),
         Run("objective", "cosine", Path("runs/space_objective/cosine"), ["--contrastive_loss", "cosine"]),
         Run("objective", "margin_02", Path("runs/space_objective/margin_02"), ["--contrastive_loss", "margin", "--contrastive_margin", "0.2"]),
+        Run("objective", "hard_ntxent", Path("runs/space_objective/hard_ntxent"), ["--contrastive_loss", "hard_ntxent", "--hard_negative_topk", "16"]),
+        Run("objective", "dcl", Path("runs/space_objective/dcl"), ["--contrastive_loss", "dcl", "--contrastive_tau_plus", "0.1"]),
+        Run("objective", "barlow_twins", Path("runs/space_objective/barlow_twins"), ["--contrastive_loss", "barlow_twins", "--contrastive_projector", "mlp", "--contrastive_dim", "256"]),
+        Run("objective", "vicreg", Path("runs/space_objective/vicreg"), ["--contrastive_loss", "vicreg", "--contrastive_projector", "mlp", "--contrastive_dim", "256"]),
+        Run("objective", "queue_ntxent", Path("runs/space_objective/queue_ntxent"), ["--contrastive_loss", "ntxent", "--contrastive_queue_size", "1024"]),
         Run("objective", "no_contrast", Path("runs/space_objective/no_contrast"), ["--disable_contrastive"]),
     ]
 

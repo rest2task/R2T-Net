@@ -130,7 +130,7 @@ def evaluate_alignment(model, loader, device, amp):
             rest_sig = torch.nn.functional.normalize(unwrap(model).encode(rest, torch.zeros(rest.size(0), dtype=torch.long, device=device)), dim=1)
             task_sig = torch.nn.functional.normalize(unwrap(model).encode(task, torch.ones(task.size(0), dtype=torch.long, device=device)), dim=1)
             sim = rest_sig @ task_sig.t()
-            losses.append(unwrap(model)._contrastive_loss(rest_sig, task_sig).detach())
+            losses.append(unwrap(model)._contrastive_loss(rest_sig, task_sig, batch.get("target")).detach())
         diag = sim.diag()
         mask = ~torch.eye(sim.size(0), device=sim.device, dtype=torch.bool)
         pos.append(diag.detach().float().cpu())

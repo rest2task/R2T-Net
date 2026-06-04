@@ -67,6 +67,20 @@ python -m studies.artifacts saliency --ckpt runs/hcp_grayord_r2t/last.pt --data-
 These commands emit counts, cosine rows, signatures, or gradient-input maps.
 They do not run bootstrap, ANOVA, permutation, group t-tests, or FDR correction.
 
+ADNI structural controls:
+
+```bash
+python -m studies.adni_structural_control
+python -m studies.adni_structural_control --control-predictions temporal_mean=adni_temporal_mean_predictions.csv --control-predictions time_shuffled=adni_time_shuffled_predictions.csv
+python -m studies.adni_structural_control --write-temporal-controls
+```
+
+The default ADNI structural-control command expects relative CSVs in the working
+directory: `adni_r2tnet_predictions.csv`, `adni_covariates.csv`, and
+`adni_structural_features.csv`. It writes ANCOVA, Digit Span, classification,
+bootstrap, and optional relevance/atrophy-overlap outputs under
+`runs/adni_structural_control`.
+
 `manifest.py` writes the JSONL manifests from source trees.  Pass a participant
 table when labels or fixed train/val/test splits are known.
 
