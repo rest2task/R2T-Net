@@ -10,6 +10,7 @@ python -m studies.chcp --ckpt runs/hcp_grayord_r2t/last.pt
 python -m studies.chcp --finetune
 python -m studies.adni --ckpt runs/hcp_raw4d_r2t/last.pt
 python -m studies.adni --probe
+python -m studies.adni_classification
 ```
 
 Model comparisons:
@@ -80,6 +81,21 @@ directory: `adni_r2tnet_predictions.csv`, `adni_covariates.csv`, and
 `adni_structural_features.csv`. It writes ANCOVA, Digit Span, classification,
 bootstrap, and optional relevance/atrophy-overlap outputs under
 `runs/adni_structural_control`.
+
+ADNI AD/CN/MCI classification:
+
+```bash
+python -m studies.adni_classification
+python -m studies.adni_classification --write-participants --csv 3T_HCP_Proc_6_12_2025.csv
+python -m studies.adni_classification --scratch
+python -m studies.adni_classification --freeze-encoder
+```
+
+The default command prints the participant-table, manifest, conversion,
+fine-tuning, and test commands. It reads ADNI fMRI rows from
+`3T_HCP_Proc_6_12_2025.csv`, maps `AD`, `CN`, and `MCI` labels to one-hot
+targets, collapses `EMCI`/`LMCI` into `MCI` by default, and excludes `SMC`.
+Pass `--mci-policy exact` to keep only rows explicitly labeled `MCI`.
 
 `manifest.py` writes the JSONL manifests from source trees.  Pass a participant
 table when labels or fixed train/val/test splits are known.

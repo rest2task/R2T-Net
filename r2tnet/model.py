@@ -267,6 +267,15 @@ class MultiTaskHead(nn.Module):
         reg_loss = torch.sum(probs * huber, dim=1).mean()
         return hparams.get("reg_alpha", 1.0) * cls_loss + hparams.get("reg_beta", 2.0) * reg_loss
 
+    def _classification_loss(self, spec, out, target, hparams):
+        mode = hparams.get("classification_loss", "auto")
+        if mode == "auto":
+            mode = "cross_entropy" if len(spec.indices) > 1 else "bce"
+        if mode == "cross_entropy":
+            labels = target.argmax(dim=1) if target.ndim > 1 and target.size(1) > 1 else target.reshape(-1).long()
+            return F.cross_entropy(out["prediction"], labels.long(), label_smoothing=hparams.get("classification_label_smoothing", 0.0))
+        return F.binary_cross_entropy_with_logits(out["prediction"], target.float())
+
     def loss(self, head_out, target, hparams):
         if target.ndim == 1:
             target = target.unsqueeze(-1)
@@ -275,7 +284,7 @@ class MultiTaskHead(nn.Module):
             cols = list(spec.indices)
             y = target[:, cols]
             out = head_out["heads"][spec.name]
-            val = F.binary_cross_entropy_with_logits(out["prediction"], y.float()) if spec.task == "classification" else self._regression_loss(spec, out, y, hparams)
+            val = self._classification_loss(spec, out, y, hparams) if spec.task == "classification" else self._regression_loss(spec, out, y, hparams)
             losses.append(float(spec.weight) * val)
             logs[f"head/{spec.name}"] = float(val.detach().cpu())
         total = torch.stack(losses).sum()
@@ -797,6 +806,8 @@ class R2TNet(nn.Module):
         downstream = p.add_argument_group("Downstream")
         downstream.add_argument("--downstream_task_type", choices=["regression", "classification"], default="regression")
         downstream.add_argument("--head_spec", default="", help="name:cols[:regression|classification[:weight]]; e.g. score:wm_0bk,wm_2bk:regression:1;rt:rt_wm,rt_rel:regression:0.3")
+        downstream.add_argument("--classification_loss", choices=["auto", "bce", "cross_entropy"], default="auto")
+        downstream.add_argument("--classification_label_smoothing", type=float, default=0.0)
         downstream.add_argument("--label_scaling_method", choices=["standardization", "minmax", "none"], default="standardization")
         downstream.add_argument("--reg_head", choices=["yolo", "mlp", "linear"], default="yolo")
         downstream.add_argument("--reg_loss", choices=["huber", "mse", "l1"], default="huber")

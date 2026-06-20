@@ -38,7 +38,7 @@ data/<experiment>/
 {
   "schema": "r2t.manifest.v2",
   "study": "hcp",
-  "source_root": "/nfshdd/y2jiang/HCP_1200",
+  "source_root": "/path/to/HCP_1200",
   "targets": ["wm_0bk", "wm_2bk", "wm_diff", "rel"]
 }
 ```
@@ -52,8 +52,8 @@ data/<experiment>/
 `meta/scans.jsonl`
 
 ```json
-{"id":"100206:REST1_LR","subject":"100206","scan":"REST1_LR","role":"rest","kind":"grayord","frames":"blocks/100206/REST1_LR","n_frames":1200,"source":"/nfshdd/.../rfMRI_REST1_LR_Atlas_MSMAll_hp2000_clean.dtseries.nii"}
-{"id":"100206:WM_LR","subject":"100206","scan":"WM_LR","role":"task","kind":"grayord","frames":"blocks/100206/WM_LR","n_frames":405,"source":"/nfshdd/.../tfMRI_WM_LR_Atlas_MSMAll.dtseries.nii"}
+{"id":"100206:REST1_LR","subject":"100206","scan":"REST1_LR","role":"rest","kind":"grayord","frames":"blocks/100206/REST1_LR","n_frames":1200,"source":"/path/to/HCP_1200/100206/rfMRI_REST1_LR_Atlas_MSMAll_hp2000_clean.dtseries.nii"}
+{"id":"100206:WM_LR","subject":"100206","scan":"WM_LR","role":"task","kind":"grayord","frames":"blocks/100206/WM_LR","n_frames":405,"source":"/path/to/HCP_1200/100206/tfMRI_WM_LR_Atlas_MSMAll.dtseries.nii"}
 ```
 
 Supported `kind` values:
@@ -114,6 +114,7 @@ Supported conversion options:
 - Architecture: `--signature_dim`, `--token_dim`, `--temporal_encoder vit|gru|conv|mean`, `--swift_patch`, `--swift_stage_depths`, `--swift_stage_heads`, `--swift_global_depth`, `--swift_global_heads`, `--vit_depth`, `--vit_heads`, `--gru_depth`, `--gru_bidirectional`, `--conv_depth`, `--conv_kernel`, and `--encoder_dropout`.
 - Training and objective: `--pretraining`, `--freeze_encoder`, `--supervised_view rest|task|average`, `--pair_fusion auto|rest|task|average|sum|concat|gated`, `--disable_contrastive`, `--lambda_contrast`, `--lambda_synthetic`, `--lambda_synthetic_l2`, `--synthetic_mapper cmt|mlp`, `--synthetic_depth`, `--synthetic_heads`, `--synthetic_tokens`, `--synthetic_dropout`, `--temperature`, `--contrastive_loss ntxent|infonce|simclr|symmetric_ce|clip|cosine|margin|triplet|hard_ntxent|hard_infonce|dcl|debiased|barlow_twins|vicreg`, `--contrastive_margin`, `--contrastive_projector none|linear|mlp`, `--contrastive_dim`, `--contrastive_projector_hidden`, `--contrastive_queue_size`, `--hard_negative_topk`, `--contrastive_tau_plus`, `--contrastive_target_mask_quantile`, `--contrastive_barlow_lambda`, `--vicreg_sim_coeff`, `--vicreg_std_coeff`, and `--vicreg_cov_coeff`.
 - Downstream heads: `--downstream_task_type regression|classification`, `--head_spec`, `--label_scaling_method standardization|minmax|none`, `--reg_head yolo|mlp|linear`, `--reg_loss huber|mse|l1`, `--reg_num_bins`, `--reg_binning_strategy quantile|uniform`, `--reg_alpha`, `--reg_beta`, `--reg_temperature`, `--reg_label_smoothing`, `--pred_hidden_dim`, `--head_dropout`, and `--head_depth`.
+- Classification heads: `--classification_loss auto|bce|cross_entropy` and `--classification_label_smoothing`. `auto` uses binary BCE for one target column and multiclass cross-entropy for multi-column one-hot targets.
 - Regularization and augmentation: `--temporal_crop_min_ratio`, `--gaussian_noise_std`, `--gaussian_noise_p`, `--temporal_mask_p`, `--feature_mask_p`, and `--modality_dropout_p`.
 
 Named heads use the same encoder and signature. The grammar is:
@@ -130,6 +131,11 @@ Examples:
 
 --target_cols wm_0bk,wm_2bk,rt_wm,rt_rel \
 --head_spec 'score:wm_0bk,wm_2bk:regression:1.0;rt:rt_wm,rt_rel:regression:0.25'
+
+--target_cols AD,CN,MCI \
+--downstream_task_type classification \
+--head_spec 'diagnosis:AD,CN,MCI:classification:1.0' \
+--classification_loss cross_entropy
 ```
 
 ## Studies
@@ -141,6 +147,7 @@ python -m studies.hcp
 python -m studies.hcp --mode r2t --representation grayord
 python -m studies.chcp --ckpt runs/hcp_grayord_r2t/last.pt
 python -m studies.adni --ckpt runs/hcp_raw4d_r2t/last.pt
+python -m studies.adni_classification
 ```
 
 Model-comparison grids:
@@ -166,6 +173,7 @@ Supported study wrappers:
 - `python -m studies.hcp`
 - `python -m studies.chcp`
 - `python -m studies.adni`
+- `python -m studies.adni_classification`
 
 Supported study command generators:
 
@@ -218,7 +226,7 @@ These scripts are thin wrappers around the Python entry points above and mainly 
 
 Expected source file patterns:
 
-HCP under `/nfshdd/y2jiang/HCP_1200/<subject>/`
+HCP under `/path/to/HCP_1200/<subject>/`
 
 ```text
 rfMRI_REST{1,2}_{LR,RL}_Atlas_MSMAll_hp2000_clean.dtseries.nii
@@ -226,7 +234,7 @@ tfMRI_WM_{LR,RL}_Atlas_MSMAll.dtseries.nii
 tfMRI_RELATIONAL_{LR,RL}_Atlas_MSMAll.dtseries.nii
 ```
 
-CHCP under `/nfshdd/y2jiang/CHCP_DB/<subject>/`
+CHCP under `/path/to/CHCP_DB/<subject>/`
 
 ```text
 rfMRI_REST{1,2}_{AP,PA}_Atlas_hp2000_clean.dtseries.nii

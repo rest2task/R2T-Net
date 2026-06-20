@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-#export StudyDir=/localnvme/ADNI_niix
-#export StudyDir=/home/y2jiang/ADNI_niix2
-export StudyDir=/localnvme/ADNI_final
+export StudyDir="${StudyDir:-/path/to/ADNI_final}"
 
 source "${HCPPIPEDIR}/Examples/Scripts/SetUpHCPPipeline.sh"
 

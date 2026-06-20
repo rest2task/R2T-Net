@@ -26,6 +26,7 @@ def build_parser():
     p.add_argument("--precision", choices=["fp32", "amp"], default="amp")
     p.add_argument("--save_every", type=int, default=10)
     p.add_argument("--resume", default="")
+    p.add_argument("--init_from", default="", help="Initialize compatible weights from a checkpoint without resuming optimizer or epoch")
     p.add_argument("--test_only", action="store_true")
     p.add_argument("--compile", action="store_true")
     p.add_argument("--ddp", action="store_true")
@@ -104,6 +105,53 @@ def _corr(pred, target, prefix, names = None):
     return out
 
 
+def _classification_metrics(pred, target, specs, prefix):
+    out = {}
+    for spec in specs or []:
+        if getattr(spec, "task", None) != "classification":
+            continue
+        cols = list(spec.indices)
+        logits = pred[:, cols]
+        y = target[:, cols]
+        if len(cols) > 1:
+            truth = y.argmax(dim=1)
+            guess = logits.argmax(dim=1)
+            n_classes = len(cols)
+        else:
+            truth = y.reshape(-1).long()
+            guess = (logits.reshape(-1) > 0).long()
+            n_classes = 2
+        valid = torch.isfinite(truth.float())
+        if int(valid.sum()) == 0:
+            continue
+        truth = truth[valid]
+        guess = guess[valid]
+        out[f"{prefix}_acc_{spec.name}"] = float((guess == truth).float().mean())
+        recalls, f1s = [], []
+        for cls in range(n_classes):
+            tp = ((guess == cls) & (truth == cls)).sum().float()
+            fp = ((guess == cls) & (truth != cls)).sum().float()
+            fn = ((guess != cls) & (truth == cls)).sum().float()
+            if int((truth == cls).sum()) > 0:
+                recalls.append(tp / (tp + fn).clamp_min(1.0))
+            if int(tp + fp + fn) > 0:
+                f1s.append((2 * tp) / (2 * tp + fp + fn).clamp_min(1.0))
+        if recalls:
+            out[f"{prefix}_balanced_acc_{spec.name}"] = float(torch.stack(recalls).mean())
+        if f1s:
+            out[f"{prefix}_macro_f1_{spec.name}"] = float(torch.stack(f1s).mean())
+    return out
+
+
+def _regression_view(pred, target, specs, names):
+    if not specs:
+        return pred, target, names
+    indices = [i for spec in specs if getattr(spec, "task", None) == "regression" for i in spec.indices]
+    if not indices:
+        return None, None, None
+    return pred[:, indices], target[:, indices], [names[i] for i in indices] if names else None
+
+
 def _subject_average(pred, target, subject_ids):
     buckets = defaultdict(list)
     target_ref = {}
@@ -179,9 +227,16 @@ def evaluate(model, loader, device, amp):
     pred_all = torch.cat(preds)
     target_all = torch.cat(targets)
     names = getattr(unwrap(model), "target_names", None)
-    out.update(_corr(pred_all, target_all, "window", names))
+    specs = getattr(unwrap(model), "head_specs", None)
+    out.update(_classification_metrics(pred_all, target_all, specs, "window"))
+    reg_pred, reg_target, reg_names = _regression_view(pred_all, target_all, specs, names)
+    if reg_pred is not None:
+        out.update(_corr(reg_pred, reg_target, "window", reg_names))
     pred_subj, target_subj = _subject_average(pred_all, target_all, subjects)
-    out.update(_corr(pred_subj, target_subj, "subject", names))
+    out.update(_classification_metrics(pred_subj, target_subj, specs, "subject"))
+    reg_pred, reg_target, reg_names = _regression_view(pred_subj, target_subj, specs, names)
+    if reg_pred is not None:
+        out.update(_corr(reg_pred, reg_target, "subject", reg_names))
     return out
 
 
@@ -249,6 +304,20 @@ def build_scheduler(optimizer, args, steps_per_epoch = 1):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, scale)
 
 
+def load_compatible_state(model, state):
+    current = unwrap(model).state_dict()
+    compatible = {
+        key: value
+        for key, value in state.items()
+        if key in current
+        and not isinstance(current[key], UninitializedParameter)
+        and hasattr(value, "shape")
+        and tuple(value.shape) == tuple(current[key].shape)
+    }
+    missing, unexpected = unwrap(model).load_state_dict(compatible, strict=False)
+    return len(compatible), len(missing), len(unexpected)
+
+
 def main():
     args = build_parser().parse_args()
     rank, _, local_rank = ddp_setup(args)
@@ -285,6 +354,12 @@ def main():
         if not args.test_only and scheduler is not None and "scheduler" in ckpt:
             scheduler.load_state_dict(ckpt["scheduler"])
         start_epoch = int(ckpt["epoch"]) + 1
+    elif args.init_from:
+        ckpt = torch.load(args.init_from, map_location="cpu", weights_only=False)
+        state = ckpt["state_dict"] if "state_dict" in ckpt else ckpt
+        loaded, missing, unexpected = load_compatible_state(model, state)
+        if rank == 0:
+            print(json.dumps({"init_from": args.init_from, "loaded_tensors": loaded, "missing_tensors": missing, "unexpected_tensors": unexpected}))
 
     amp = args.precision == "amp"
     scaler = torch.amp.GradScaler("cuda", enabled=amp and device.type == "cuda")

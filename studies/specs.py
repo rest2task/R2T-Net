@@ -50,10 +50,13 @@ ADNI_SCANS = (
     ScanPattern("rest", "*rfMRI*.nii.gz", "vol", 300),
 )
 
+ADNI_CLASS_TARGETS = ("AD", "CN", "MCI")
+
 STUDIES = {
-    "hcp": StudySpec("hcp", Path("/nfshdd/y2jiang/HCP_1200"), Path("data/hcp_grayord"), TARGETS, HCP_SCANS),
-    "chcp": StudySpec("chcp", Path("/nfshdd/y2jiang/CHCP_DB"), Path("data/chcp_grayord"), TARGETS, CHCP_SCANS, Path("runs/hcp_r2t/last.pt")),
-    "adni": StudySpec("adni", Path("/nfshdd/y2jiang/ADNI"), Path("data/adni_raw4d"), ("wm_0bk", "wm_2bk", "rel"), ADNI_SCANS, Path("runs/hcp_raw4d_r2t/last.pt")),
+    "hcp": StudySpec("hcp", Path("/path/to/HCP_1200"), Path("data/hcp_grayord"), TARGETS, HCP_SCANS),
+    "chcp": StudySpec("chcp", Path("/path/to/CHCP_DB"), Path("data/chcp_grayord"), TARGETS, CHCP_SCANS, Path("runs/hcp_r2t/last.pt")),
+    "adni": StudySpec("adni", Path("/path/to/ADNI"), Path("data/adni_raw4d"), ("wm_0bk", "wm_2bk", "rel"), ADNI_SCANS, Path("runs/hcp_raw4d_r2t/last.pt")),
+    "adni_classification": StudySpec("adni_classification", Path("/path/to/ADNI"), Path("data/adni_classification_raw4d"), ADNI_CLASS_TARGETS, ADNI_SCANS, Path("runs/hcp_raw4d_r2t/last.pt")),
 }
 
 REPRESENTATIONS = {
