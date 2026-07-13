@@ -16,7 +16,7 @@ from sklearn.preprocessing import MinMaxScaler, StandardScaler
 from torch import Tensor, nn
 
 from .backbones.swift import SwiFTConfig, SwiFTEncoder
-from .backbones.temporal import TemporalConvEncoder, TemporalGRUEncoder, TemporalMeanEncoder, TemporalViTEncoder
+from .backbones.temporal import TemporalConvEncoder, TemporalGRUEncoder, TemporalMeanEncoder, TemporalTimeSformerEncoder, TemporalViTEncoder
 
 
 class ClassificationHead(nn.Module):
@@ -215,7 +215,10 @@ class MultiTaskHead(nn.Module):
         by_head = {name: head(x) for name, head in self.heads.items()}
         pred = x.new_zeros((x.size(0), self.target_dim))
         for spec in self.specs:
-            pred[:, list(spec.indices)] = by_head[spec.name]["prediction"]
+            head_pred = by_head[spec.name]["prediction"]
+            if torch.is_floating_point(head_pred) and head_pred.dtype != pred.dtype:
+                head_pred = head_pred.to(dtype=pred.dtype)
+            pred[:, list(spec.indices)] = head_pred
         return {"prediction": pred, "heads": by_head}
 
     def _scale_target(self, spec, y):
@@ -223,8 +226,12 @@ class MultiTaskHead(nn.Module):
         if kind is None:
             return y
         if kind == "standard":
-            return (y - getattr(self, f"{spec.name}_mean").to(y.device)) / getattr(self, f"{spec.name}_scale").to(y.device)
-        return (y - getattr(self, f"{spec.name}_min").to(y.device)) / getattr(self, f"{spec.name}_range").to(y.device)
+            mean = getattr(self, f"{spec.name}_mean").to(device=y.device, dtype=y.dtype)
+            scale = getattr(self, f"{spec.name}_scale").to(device=y.device, dtype=y.dtype)
+            return (y - mean) / scale
+        min_value = getattr(self, f"{spec.name}_min").to(device=y.device, dtype=y.dtype)
+        value_range = getattr(self, f"{spec.name}_range").to(device=y.device, dtype=y.dtype)
+        return (y - min_value) / value_range
 
     def inverse_scale(self, prediction):
         if prediction.ndim == 1:
@@ -235,20 +242,25 @@ class MultiTaskHead(nn.Module):
             vals = prediction[:, cols]
             kind = self.scaler_type.get(spec.name)
             if kind == "standard":
-                vals = vals * getattr(self, f"{spec.name}_scale").to(vals.device) + getattr(self, f"{spec.name}_mean").to(vals.device)
+                scale = getattr(self, f"{spec.name}_scale").to(device=vals.device, dtype=vals.dtype)
+                mean = getattr(self, f"{spec.name}_mean").to(device=vals.device, dtype=vals.dtype)
+                vals = vals * scale + mean
             elif kind == "minmax":
-                vals = vals * getattr(self, f"{spec.name}_range").to(vals.device) + getattr(self, f"{spec.name}_min").to(vals.device)
+                value_range = getattr(self, f"{spec.name}_range").to(device=vals.device, dtype=vals.dtype)
+                min_value = getattr(self, f"{spec.name}_min").to(device=vals.device, dtype=vals.dtype)
+                vals = vals * value_range + min_value
             out[:, cols] = vals
         return out.squeeze(0) if out.size(0) == 1 else out
 
     @staticmethod
     def _assign_bins(head, target):
-        interior = head.bin_edges.to(target.device)[1:-1]
+        interior = head.bin_edges.to(device=target.device, dtype=target.dtype)[1:-1]
         return torch.stack([torch.clamp(torch.bucketize(target[:, j].contiguous(), interior[:, j].contiguous()), max=head.num_bins - 1) for j in range(target.size(1))], dim=1)
 
     def _regression_loss(self, spec, out, target, hparams):
+        target_dtype = out["prediction"].dtype
         if hparams.get("reg_head", "yolo") != "yolo":
-            target = self._scale_target(spec, target.float())
+            target = self._scale_target(spec, target.to(dtype=target_dtype))
             loss_name = hparams.get("reg_loss", "huber")
             if loss_name == "mse":
                 return F.mse_loss(out["prediction"], target)
@@ -256,13 +268,13 @@ class MultiTaskHead(nn.Module):
                 return F.l1_loss(out["prediction"], target)
             return F.smooth_l1_loss(out["prediction"], target)
         head = self.heads[spec.name]
-        target = self._scale_target(spec, target.float())
+        target = self._scale_target(spec, target.to(dtype=target_dtype))
         logits, probs, residual = out["logits"], out["probabilities"], out["residual"]
         labels = self._assign_bins(head, target)
         logits_rep = logits.unsqueeze(1).expand(-1, target.size(1), -1).reshape(-1, probs.size(1))
         cls_loss = F.cross_entropy(logits_rep, labels.reshape(-1), label_smoothing=hparams.get("reg_label_smoothing", 0.0))
-        centers = head.bin_centers.to(target.device).unsqueeze(0)
-        widths = head.bin_widths.to(target.device).unsqueeze(0)
+        centers = head.bin_centers.to(device=target.device, dtype=target.dtype).unsqueeze(0)
+        widths = head.bin_widths.to(device=target.device, dtype=target.dtype).unsqueeze(0)
         huber = F.smooth_l1_loss(residual, (target.unsqueeze(1) - centers) / widths, reduction="none").mean(dim=2)
         reg_loss = torch.sum(probs * huber, dim=1).mean()
         return hparams.get("reg_alpha", 1.0) * cls_loss + hparams.get("reg_beta", 2.0) * reg_loss
@@ -274,7 +286,7 @@ class MultiTaskHead(nn.Module):
         if mode == "cross_entropy":
             labels = target.argmax(dim=1) if target.ndim > 1 and target.size(1) > 1 else target.reshape(-1).long()
             return F.cross_entropy(out["prediction"], labels.long(), label_smoothing=hparams.get("classification_label_smoothing", 0.0))
-        return F.binary_cross_entropy_with_logits(out["prediction"], target.float())
+        return F.binary_cross_entropy_with_logits(out["prediction"], target.to(dtype=out["prediction"].dtype))
 
     def loss(self, head_out, target, hparams):
         if target.ndim == 1:
@@ -342,32 +354,49 @@ class R2TNet(nn.Module):
             dropout=hparams.get("encoder_dropout", 0.1),
         )
         self.swift_encoder = SwiFTEncoder(swift_config, latent_dim=self.signature_dim)
+        temporal_encoder = str(hparams.get("temporal_encoder", "vit")).lower()
+        compact_model = bool(hparams.get("compact_model", False))
+        build_all_temporal = not compact_model
         self.temporal_vit = TemporalViTEncoder(
             token_dim=hparams.get("token_dim", 768),
             depth=hparams.get("vit_depth", 12),
             num_heads=hparams.get("vit_heads", 12),
             dropout=hparams.get("encoder_dropout", 0.1),
             latent_dim=self.signature_dim,
-        )
+            pooling=hparams.get("vit_pooling", "cls"),
+            norm_first=hparams.get("vit_norm_first", True),
+        ) if build_all_temporal or temporal_encoder == "vit" else None
+        self.temporal_timesformer = TemporalTimeSformerEncoder(
+            token_dim=hparams.get("token_dim", 768),
+            depth=hparams.get("timesformer_depth", hparams.get("vit_depth", 12)),
+            num_heads=hparams.get("timesformer_heads", hparams.get("vit_heads", 12)),
+            dropout=hparams.get("encoder_dropout", 0.1),
+            latent_dim=self.signature_dim,
+            patch_vertices=hparams.get("timesformer_patch_vertices", 8192),
+            mlp_ratio=hparams.get("timesformer_mlp_ratio", 4.0),
+            max_time=hparams.get("timesformer_max_time", 1200),
+            max_spatial_patches=hparams.get("timesformer_max_spatial_patches", 1024),
+            pooling=hparams.get("timesformer_pooling", hparams.get("vit_pooling", "cls")),
+        ) if build_all_temporal or temporal_encoder == "timesformer" else None
         self.temporal_gru = TemporalGRUEncoder(
             token_dim=hparams.get("token_dim", 768),
             depth=hparams.get("gru_depth", 2),
             dropout=hparams.get("encoder_dropout", 0.1),
             latent_dim=self.signature_dim,
             bidirectional=hparams.get("gru_bidirectional", True),
-        )
+        ) if build_all_temporal or temporal_encoder == "gru" else None
         self.temporal_conv = TemporalConvEncoder(
             token_dim=hparams.get("token_dim", 768),
             depth=hparams.get("conv_depth", 4),
             kernel_size=hparams.get("conv_kernel", 7),
             dropout=hparams.get("encoder_dropout", 0.1),
             latent_dim=self.signature_dim,
-        )
+        ) if build_all_temporal or temporal_encoder == "conv" else None
         self.temporal_mean = TemporalMeanEncoder(
             token_dim=hparams.get("token_dim", 768),
             dropout=hparams.get("encoder_dropout", 0.1),
             latent_dim=self.signature_dim,
-        )
+        ) if build_all_temporal or temporal_encoder == "mean" else None
         self.modality_emb = nn.Embedding(2, hparams.get("token_dim", 768))
         if hparams.get("synthetic_mapper", "cmt") == "mlp":
             self.synthetic_mapper = nn.Sequential(
@@ -415,7 +444,17 @@ class R2TNet(nn.Module):
         self.register_buffer("contrastive_queue_fill", torch.zeros((), dtype=torch.long))
 
         if hparams.get("freeze_encoder", False):
-            for module in (self.swift_encoder, self.temporal_vit, self.temporal_gru, self.temporal_conv, self.temporal_mean, self.modality_emb):
+            for module in (
+                self.swift_encoder,
+                self.temporal_vit,
+                self.temporal_timesformer,
+                self.temporal_gru,
+                self.temporal_conv,
+                self.temporal_mean,
+                self.modality_emb,
+            ):
+                if module is None:
+                    continue
                 for param in module.parameters():
                     param.requires_grad = False
 
@@ -425,12 +464,24 @@ class R2TNet(nn.Module):
             return self.swift_encoder(x, modality_embed)
         if x.ndim == 3:
             encoder = self.hparams.get("temporal_encoder", "vit")
+            if encoder == "timesformer":
+                if self.temporal_timesformer is None:
+                    raise ValueError("TimeSformer encoder was not instantiated")
+                return self.temporal_timesformer(x, modality_embed)
             if encoder == "gru":
+                if self.temporal_gru is None:
+                    raise ValueError("GRU encoder was not instantiated")
                 return self.temporal_gru(x, modality_embed)
             if encoder == "conv":
+                if self.temporal_conv is None:
+                    raise ValueError("Conv encoder was not instantiated")
                 return self.temporal_conv(x, modality_embed)
             if encoder == "mean":
+                if self.temporal_mean is None:
+                    raise ValueError("Mean encoder was not instantiated")
                 return self.temporal_mean(x, modality_embed)
+            if self.temporal_vit is None:
+                raise ValueError("ViT encoder was not instantiated")
             return self.temporal_vit(x, modality_embed)
         raise ValueError(f"Unsupported input shape {tuple(x.shape)}")
 
@@ -736,7 +787,16 @@ class R2TNet(nn.Module):
         arch.add_argument("--encoder_dropout", type=float, default=0.1)
         arch.add_argument("--vit_depth", type=int, default=12)
         arch.add_argument("--vit_heads", type=int, default=12)
-        arch.add_argument("--temporal_encoder", choices=["vit", "gru", "conv", "mean"], default="vit")
+        arch.add_argument("--vit_pooling", choices=["cls", "mean", "cls_mean", "attn"], default="cls")
+        arch.add_argument("--vit_norm_first", action=argparse.BooleanOptionalAction, default=True)
+        arch.add_argument("--timesformer_depth", type=int, default=12)
+        arch.add_argument("--timesformer_heads", type=int, default=12)
+        arch.add_argument("--timesformer_patch_vertices", type=int, default=8192)
+        arch.add_argument("--timesformer_mlp_ratio", type=float, default=4.0)
+        arch.add_argument("--timesformer_max_time", type=int, default=1200)
+        arch.add_argument("--timesformer_max_spatial_patches", type=int, default=1024)
+        arch.add_argument("--timesformer_pooling", choices=["cls", "mean", "cls_mean", "attn"], default="cls")
+        arch.add_argument("--temporal_encoder", choices=["vit", "timesformer", "gru", "conv", "mean"], default="vit")
         arch.add_argument("--gru_depth", type=int, default=2)
         arch.add_argument("--gru_bidirectional", action=argparse.BooleanOptionalAction, default=True)
         arch.add_argument("--conv_depth", type=int, default=4)

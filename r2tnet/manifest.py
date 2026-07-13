@@ -31,6 +31,11 @@ class ScanRecord:
     path: Path
     input_kind: str
     n_frames: int
+    storage: str = "frames"
+    dtype: str = ""
+    shape: tuple[int, ...] = ()
+    mask_path: Path | None = None
+    mask_voxels: int = 0
 
 
 def read_csv(path):
@@ -64,6 +69,19 @@ def scan_rows(data_dir):
 def resolve_path(data_dir, value):
     path = Path(value)
     return path if path.is_absolute() else data_dir / path
+
+
+def _parse_shape(value):
+    if value in (None, ""):
+        return ()
+    if isinstance(value, (list, tuple)):
+        return tuple(int(x) for x in value)
+    text = str(value).strip()
+    if not text:
+        return ()
+    if text.startswith("["):
+        return tuple(int(x) for x in json.loads(text))
+    return tuple(int(x) for x in text.replace("x", ",").split(",") if x.strip())
 
 
 def frame_index(path):
@@ -120,6 +138,7 @@ def load_scans(data_dir):
         if input_kind not in INPUT_KINDS:
             raise ValueError(f"Bad input_kind {input_kind!r}; expected {sorted(INPUT_KINDS)}")
         path = resolve_path(data_dir, row.get("frames") or row["path"])
+        mask_value = row.get("mask_path") or row.get("mask")
         n_frames = int(row.get("n_frames") or len(frame_index(path)))
         scan_id = str(row.get("scan") or row.get("scan_id") or row["id"])
         if kind == "jsonl" and ":" in scan_id:
@@ -131,6 +150,11 @@ def load_scans(data_dir):
             path=path,
             input_kind=input_kind,
             n_frames=n_frames,
+            storage=str(row.get("storage") or row.get("format") or "frames").strip().lower(),
+            dtype=str(row.get("dtype") or row.get("storage_dtype") or "").strip().lower(),
+            shape=_parse_shape(row.get("shape") or row.get("spatial_shape") or row.get("volume_shape")),
+            mask_path=resolve_path(data_dir, mask_value) if mask_value else None,
+            mask_voxels=int(row.get("mask_voxels") or row.get("n_mask_voxels") or 0),
         )
         out.setdefault(rec.subject_id, []).append(rec)
     return out

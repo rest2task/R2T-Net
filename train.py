@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import argparse
 from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser
 from collections import defaultdict
 from pathlib import Path
@@ -40,6 +41,7 @@ def build_parser():
     p.add_argument("--step_gamma", type=float, default=0.5)
     p.add_argument("--early_stop_patience", type=int, default=0)
     p.add_argument("--selection_metric", choices=["auto", "loss", "alignment"], default="auto")
+    p.add_argument("--compact_model", action=argparse.BooleanOptionalAction, default=True, help="Instantiate only modules used by the selected temporal encoder")
     p = R2TNet.add_model_specific_args(p)
     p = fMRIDataModule.add_data_specific_args(p)
     return p
@@ -226,6 +228,10 @@ def evaluate(model, loader, device, amp):
         return out
     pred_all = torch.cat(preds)
     target_all = torch.cat(targets)
+    if pred_all.ndim == 1:
+        pred_all = pred_all.unsqueeze(1)
+    if target_all.ndim == 1:
+        target_all = target_all.unsqueeze(1)
     names = getattr(unwrap(model), "target_names", None)
     specs = getattr(unwrap(model), "head_specs", None)
     out.update(_classification_metrics(pred_all, target_all, specs, "window"))

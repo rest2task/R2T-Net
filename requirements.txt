@@ -7,3 +7,7 @@ tqdm==4.67.1
 nibabel==5.3.2
 einops==0.8.1
 monai==1.5.2
+causal-conv1d @ https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.6.2.post1/causal_conv1d-1.6.2.post1%2Bcu12torch2.8cxx11abiTRUE-cp313-cp313-linux_x86_64.whl ; python_version == "3.13" and platform_machine == "x86_64"
+mamba-ssm @ https://github.com/state-spaces/mamba/releases/download/v2.3.2.post1/mamba_ssm-2.3.2.post1%2Bcu12torch2.8cxx11abiTRUE-cp313-cp313-linux_x86_64.whl ; python_version == "3.13" and platform_machine == "x86_64"
+causal-conv1d==1.6.2.post1 ; python_version != "3.13"
+mamba-ssm==2.3.2.post1 ; python_version != "3.13"

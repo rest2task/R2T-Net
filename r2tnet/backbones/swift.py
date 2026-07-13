@@ -102,11 +102,13 @@ class SwiFTEncoder(nn.Module):
 
         b, c, h, w, d, t = x.shape
         ps = self.config.patch_size
-        if any(dim % size != 0 for dim, size in zip((h, w, d, t), ps)):
-            raise ValueError(
-                "Input dimensions must be divisible by patch_size; "
-                f"got {(h, w, d, t)} vs {ps}"
-            )
+        pad_h = (ps[0] - h % ps[0]) % ps[0]
+        pad_w = (ps[1] - w % ps[1]) % ps[1]
+        pad_d = (ps[2] - d % ps[2]) % ps[2]
+        pad_t = (ps[3] - t % ps[3]) % ps[3]
+        if pad_h or pad_w or pad_d or pad_t:
+            x = F.pad(x, (0, pad_t, 0, pad_d, 0, pad_w, 0, pad_h))
+            b, c, h, w, d, t = x.shape
 
         h_chunks, w_chunks, d_chunks, t_chunks = (
             h // ps[0],
@@ -180,4 +182,3 @@ class SwiFTEncoder(nn.Module):
         pooled = tokens.mean(dim=1)
         latent = self.proj(pooled)
         return F.normalize(latent, dim=-1)
-

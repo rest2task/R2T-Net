@@ -26,7 +26,10 @@ def _predict_tensor(model, x, modality_id, device):
     x = x.unsqueeze(0).to(device)
     modality = torch.tensor([modality_id], device=device)
     _, pred = model(x, modality)
-    return model.inverse_scale(pred).squeeze(0).to("cpu").float().tolist()
+    values = model.inverse_scale(pred).squeeze(0).to("cpu").float()
+    if values.ndim == 0:
+        values = values.unsqueeze(0)
+    return values.tolist()
 
 
 def predict_folder(model, input_dir, device, role):
